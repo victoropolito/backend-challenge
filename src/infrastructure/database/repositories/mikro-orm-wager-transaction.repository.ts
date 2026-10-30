@@ -3,8 +3,8 @@ import type { FailureCode } from '../../../domain/wagering/failure-code';
 import { Money } from '../../../domain/shared/money';
 import {
   WagerTransaction,
-  type WagerTransactionKind,
-  type WagerTransactionStatus,
+  WagerTransactionKind,
+  WagerTransactionStatus,
 } from '../../../domain/wagering/wager-transaction';
 import {
   DuplicateWagerTransactionError,
@@ -38,6 +38,15 @@ export class MikroOrmWagerTransactionRepository extends WagerTransactionReposito
     return this.findOne({ providerId, idempotencyKey });
   }
 
+  async hasProcessedReversal(referenceTransactionId: string): Promise<boolean> {
+    const count = await this.em.count(WagerTransactionSchema, {
+      referenceTransactionId,
+      status: WagerTransactionStatus.Processed,
+      kind: { $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback] },
+    });
+    return count > 0;
+  }
+
   async insert(transaction: WagerTransaction): Promise<void> {
     await this.translateConflicts(transaction, () => this.em.insert(WagerTransactionSchema, toRecord(transaction)));
   }
@@ -54,6 +63,7 @@ export class MikroOrmWagerTransactionRepository extends WagerTransactionReposito
           processedAt: transaction.processedAt ?? null,
           referenceCheckAttempts: transaction.referenceCheckAttempts,
           nextReferenceCheckAt: transaction.nextReferenceCheckAt ?? null,
+          observedBalance: transaction.observedBalance?.toJSON().amount ?? null,
         },
       ),
     );
@@ -102,6 +112,10 @@ function toDomain(record: WagerTransactionRecord): WagerTransaction {
     processedAt: record.processedAt ?? undefined,
     referenceCheckAttempts: record.referenceCheckAttempts,
     nextReferenceCheckAt: record.nextReferenceCheckAt ?? undefined,
+    observedBalance:
+      record.observedBalance === null
+        ? undefined
+        : Money.rehydrate({ amount: record.observedBalance, currency: record.currency }),
   });
 }
 
@@ -126,6 +140,7 @@ function toRecord(transaction: WagerTransaction): WagerTransactionRecord {
     processedAt: transaction.processedAt ?? null,
     referenceCheckAttempts: transaction.referenceCheckAttempts,
     nextReferenceCheckAt: transaction.nextReferenceCheckAt ?? null,
+    observedBalance: transaction.observedBalance?.toJSON().amount ?? null,
     createdAt: transaction.createdAt,
   };
 }

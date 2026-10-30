@@ -21,6 +21,7 @@ export interface WagerTransactionRecord {
   processedAt: Date | null;
   referenceCheckAttempts: number;
   nextReferenceCheckAt: Date | null;
+  observedBalance: string | null;
   createdAt: Date;
 }
 
@@ -47,6 +48,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     processedAt: { type: 'datetime', columnType: 'timestamptz(3)', nullable: true },
     referenceCheckAttempts: { type: 'integer' },
     nextReferenceCheckAt: { type: 'datetime', columnType: 'timestamptz(3)', nullable: true },
+    observedBalance: { type: 'decimal', precision: 20, scale: 2, nullable: true },
     createdAt: { type: 'datetime', columnType: 'timestamptz(3)' },
   },
 });

@@ -17,6 +17,7 @@ const usd = (amount: string) => Money.from({ amount, currency: 'USD' });
 
 const createdAt = new Date('2026-10-30T12:00:00Z');
 const at = new Date('2026-10-30T12:00:01Z');
+const BALANCE = Money.from({ amount: '975.00', currency: 'BRL' });
 
 const props = (overrides: Partial<CreateWagerTransactionProps> = {}): CreateWagerTransactionProps => ({
   id: 'tx-1',
@@ -39,7 +40,7 @@ const pending = (overrides: Partial<CreateWagerTransactionProps> = {}) => WagerT
 
 const processed = (overrides: Partial<CreateWagerTransactionProps> = {}) => {
   const transaction = pending(overrides);
-  transaction.markProcessed(undefined, at);
+  transaction.markProcessed(undefined, Money.from({ amount: '975.00', currency: transaction.money.currency }), at);
   return transaction;
 };
 
@@ -125,6 +126,7 @@ describe('WagerTransaction', () => {
 
       expect(opening.kind).toBe(Kind.Opening);
       expect(opening.status).toBe(Status.Processed);
+      expect(opening.observedBalance).toEqual(opening.money);
       expect(opening.providerId).toBe(INTERNAL_PROVIDER_ID);
       expect(opening.externalTransactionId).toBe('wallet-opening:wallet-1');
       expect(opening.processedAt).toEqual(at);
@@ -167,9 +169,10 @@ describe('WagerTransaction', () => {
       expect(transaction.referenceCheckAttempts).toBe(2);
       expect(transaction.nextReferenceCheckAt).toEqual(secondCheck);
 
-      transaction.markProcessed('tx-1', at);
+      transaction.markProcessed('tx-1', BALANCE, at);
       expect(transaction.status).toBe(Status.Processed);
       expect(transaction.referenceTransactionId).toBe('tx-1');
+      expect(transaction.observedBalance).toEqual(BALANCE);
       expect(transaction.nextReferenceCheckAt).toBeUndefined();
     });
 
@@ -184,11 +187,33 @@ describe('WagerTransaction', () => {
 
     it('PENDING → REJECTED keeps the failure code and optional reference', () => {
       const transaction = reversal(Kind.Rollback);
-      transaction.reject(FailureCode.ReversalInsufficientBalance, 'tx-1');
+      transaction.reject(FailureCode.ReversalInsufficientBalance, { referenceTransactionId: 'tx-1', observedBalance: brl('10.00') });
       expect(transaction.status).toBe(Status.Rejected);
       expect(transaction.failureCode).toBe(FailureCode.ReversalInsufficientBalance);
       expect(transaction.referenceTransactionId).toBe('tx-1');
+      expect(transaction.observedBalance).toEqual(brl('10.00'));
       expect(transaction.processedAt).toBeUndefined();
+    });
+
+    it('PENDING → REJECTED without observed balance when the wallet was not usable', () => {
+      const transaction = pending();
+      transaction.reject(FailureCode.WalletNotFound);
+      expect(transaction.observedBalance).toBeUndefined();
+    });
+
+    it('records the observed balance when processed', () => {
+      expect(processed().observedBalance).toEqual(BALANCE);
+      expect(pending().observedBalance).toBeUndefined();
+    });
+
+    it.each([
+      ['in another currency', usd('975.00')],
+      ['negative', Money.rehydrate({ amount: '-1.00', currency: 'BRL' })],
+    ])('refuses an observed balance %s', (_, balance) => {
+      expect(() => pending().markProcessed(undefined, balance, at)).toThrow(InvalidTransactionStateError);
+      expect(() => pending().reject(FailureCode.InsufficientBalance, { observedBalance: balance })).toThrow(
+        InvalidTransactionStateError,
+      );
     });
 
     it('PENDING → FAILED', () => {
@@ -200,7 +225,7 @@ describe('WagerTransaction', () => {
     });
 
     it('does not keep a resolved reference on a transaction without reference', () => {
-      expect(() => pending().reject(FailureCode.InsufficientBalance, 'tx-0')).toThrow(InvalidTransactionStateError);
+      expect(() => pending().reject(FailureCode.InsufficientBalance, { referenceTransactionId: 'tx-0' })).toThrow(InvalidTransactionStateError);
     });
 
     it('does not reject with an infrastructure failure code', () => {
@@ -208,11 +233,11 @@ describe('WagerTransaction', () => {
     });
 
     it('requires the resolved reference id when processing a referencing transaction', () => {
-      expect(() => reversal(Kind.Refund).markProcessed(undefined, at)).toThrow(InvalidTransactionStateError);
+      expect(() => reversal(Kind.Refund).markProcessed(undefined, BALANCE, at)).toThrow(InvalidTransactionStateError);
     });
 
     it('does not accept a reference id for a transaction without reference', () => {
-      expect(() => pending().markProcessed('tx-0', at)).toThrow(InvalidTransactionStateError);
+      expect(() => pending().markProcessed('tx-0', BALANCE, at)).toThrow(InvalidTransactionStateError);
     });
 
     it('PENDING_REFERENCE only applies to transactions with a reference', () => {
@@ -241,7 +266,7 @@ describe('WagerTransaction', () => {
       ];
 
       const transitions: [string, (t: WagerTransaction) => void][] = [
-        ['markProcessed', (t) => t.markProcessed(undefined, at)],
+        ['markProcessed', (t) => t.markProcessed(undefined, BALANCE, at)],
         ['markPendingReference', (t) => t.markPendingReference(at)],
         ['reject', (t) => t.reject(FailureCode.InsufficientBalance)],
         ['fail', (t) => t.fail(FailureCode.ProcessingError)],
@@ -350,7 +375,7 @@ describe('WagerTransaction', () => {
 
     it('ROLLBACK accepts a processed REFUND', () => {
       const refund = reversal(Kind.Refund, { id: 'tx-r', externalTransactionId: 'ext-1', referenceExternalTransactionId: 'ext-0' });
-      refund.markProcessed('tx-0', at);
+      refund.markProcessed('tx-0', BALANCE, at);
       expect(reversal(Kind.Rollback).checkReference(refund)).toBeUndefined();
     });
 
@@ -380,12 +405,14 @@ describe('WagerTransaction', () => {
         processedAt: undefined,
         referenceCheckAttempts: 0,
         nextReferenceCheckAt: undefined,
+        observedBalance: brl('5.00'),
       });
 
       expect(transaction.kind).toBe(Kind.Opening);
+      expect(transaction.observedBalance).toEqual(brl('5.00'));
       expect(transaction.status).toBe(Status.Rejected);
       expect(transaction.failureCode).toBe(FailureCode.InsufficientBalance);
-      expect(() => transaction.markProcessed(undefined, at)).toThrow(InvalidTransactionStateError);
+      expect(() => transaction.markProcessed(undefined, BALANCE, at)).toThrow(InvalidTransactionStateError);
     });
   });
 });

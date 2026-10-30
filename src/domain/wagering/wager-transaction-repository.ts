@@ -22,6 +22,9 @@ export abstract class WagerTransactionRepository {
 
   abstract findByIdempotencyKey(providerId: string, idempotencyKey: string): Promise<WagerTransaction | undefined>;
 
+  /** Indica se a transação já foi revertida por um REFUND ou ROLLBACK processado. */
+  abstract hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
+
   /** Lança DuplicateWagerTransactionError em conflito de external id, idempotency key ou reversão já processada. */
   abstract insert(transaction: WagerTransaction): Promise<void>;
 

@@ -35,8 +35,10 @@ const walletRow = (overrides: Row = {}): Row => ({
   ...overrides,
 });
 
+/** Transação PROCESSED por padrão; o saldo observado padrão (75.00) é o `balance_after` do lançamento padrão. */
 const transactionRow = (walletId: string, overrides: Row = {}): Row => {
   const externalId = randomUUID();
+  const status = overrides.status ?? 'PROCESSED';
   return {
     id: randomUUID(),
     provider_id: 'provider-a',
@@ -50,8 +52,9 @@ const transactionRow = (walletId: string, overrides: Row = {}): Row => {
     kind: 'BET',
     amount: '25.00',
     currency: 'BRL',
-    status: 'PROCESSED',
+    status,
     processed_at: NOW,
+    observed_balance: status === 'PROCESSED' ? '75.00' : null,
     created_at: NOW,
     ...overrides,
   };
@@ -86,6 +89,7 @@ const createFundedWallet = async (balance = '100.00', overrides: Row = {}) => {
     kind: 'OPENING',
     amount: balance,
     currency: wallet.currency,
+    observed_balance: balance,
   });
   await db.transaction(async (execute) => {
     await insertWith(execute, 'wallets', wallet);
@@ -397,10 +401,37 @@ describe('wager_transactions', () => {
     });
   });
 
+  describe('observed balance', () => {
+    it.each<[string, Row]>([
+      ['PROCESSED with balance', {}],
+      ['PROCESSED LOSS with zero balance', { kind: 'LOSS', amount: '0.00', observed_balance: '0.00' }],
+      ['REJECTED with balance', { status: 'REJECTED', processed_at: null, failure_code: 'INSUFFICIENT_BALANCE', observed_balance: '10.00' }],
+      ['REJECTED without balance', { status: 'REJECTED', processed_at: null, failure_code: 'WALLET_NOT_FOUND' }],
+    ])('accepts %s', async (_, overrides) => {
+      await createTransaction(walletId, overrides);
+    });
+
+    it.each<[string, Row]>([
+      ['PROCESSED without balance', { observed_balance: null }],
+      ['a negative balance', { observed_balance: '-0.01' }],
+      ['PENDING with balance', { status: 'PENDING', processed_at: null, observed_balance: '10.00' }],
+      ['FAILED with balance', { status: 'FAILED', processed_at: null, failure_code: 'PROCESSING_ERROR', observed_balance: '10.00' }],
+    ])('rejects %s', async (_, overrides) => {
+      await expectViolation(
+        createTransaction(walletId, overrides),
+        SqlState.CheckViolation,
+        'wager_transactions_observed_balance_check',
+      );
+    });
+  });
+
   describe('lifecycle', () => {
     it('a PENDING transaction can move to a terminal status', async () => {
       const pending = await createTransaction(walletId, { status: 'PENDING', processed_at: null });
-      await db.execute(`update wager_transactions set status = 'PROCESSED', processed_at = ? where id = ?`, [NOW, pending.id]);
+      await db.execute(
+        `update wager_transactions set status = 'PROCESSED', processed_at = ?, observed_balance = '75.00' where id = ?`,
+        [NOW, pending.id],
+      );
     });
 
     it.each<[string, Row]>([
@@ -562,9 +593,22 @@ describe('wallet_ledger_entries', () => {
         await insertWith(execute, 'wager_transactions', bet);
         await insertWith(execute, 'wallet_ledger_entries', ledgerRow(walletId, bet.id as string));
         await execute('update wallets set balance = ?, version = 2 where id = ?', ['75.00', walletId]);
-        await execute(`update wager_transactions set status = 'PROCESSED', processed_at = ? where id = ?`, [NOW, bet.id]);
+        await execute(
+          `update wager_transactions set status = 'PROCESSED', processed_at = ?, observed_balance = '75.00' where id = ?`,
+          [NOW, bet.id],
+        );
       });
       expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '75.00', ledger: '75.00' });
+    });
+
+    it("rejects an entry whose final balance differs from its transaction's observed balance", async () => {
+      const walletId = await createFundedWallet('100.00');
+      const bet = transactionRow(walletId, { observed_balance: '80.00' });
+      await expectViolation(
+        applyMovement(walletId, bet, ledgerRow(walletId, bet.id as string), 2),
+        SqlState.CheckViolation,
+        'wallet_ledger_entries_observed_balance_check',
+      );
     });
 
     it.each<[string, Row]>([

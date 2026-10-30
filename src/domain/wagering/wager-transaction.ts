@@ -54,6 +54,14 @@ export interface WagerTransactionState extends CreateWagerTransactionProps {
   processedAt: Date | undefined;
   referenceCheckAttempts: number;
   nextReferenceCheckAt: Date | undefined;
+  observedBalance: Money | undefined;
+}
+
+export interface RejectionDetails {
+  /** Id interno da referência resolvida, para auditoria. */
+  referenceTransactionId?: string | undefined;
+  /** Saldo da wallet no momento da rejeição, quando a wallet é a da transação. */
+  observedBalance?: Money | undefined;
 }
 
 export class InvalidWagerTransactionError extends DomainError {
@@ -123,6 +131,7 @@ export class WagerTransaction {
     private _processedAt: Date | undefined,
     private _referenceCheckAttempts: number,
     private _nextReferenceCheckAt: Date | undefined,
+    private _observedBalance: Money | undefined,
   ) {}
 
   /** Cria uma transação submetida por provider, em PENDING; valida campos, valor e exigência de referência. */
@@ -189,7 +198,7 @@ export class WagerTransaction {
       referenceExternalTransactionId: undefined,
       createdAt: props.at,
     });
-    transaction.markProcessed(undefined, props.at);
+    transaction.markProcessed(undefined, props.money, props.at);
     return transaction;
   }
 
@@ -215,6 +224,7 @@ export class WagerTransaction {
       state.processedAt && new Date(state.processedAt),
       state.referenceCheckAttempts,
       state.nextReferenceCheckAt && new Date(state.nextReferenceCheckAt),
+      state.observedBalance,
     );
   }
 
@@ -238,6 +248,7 @@ export class WagerTransaction {
       undefined,
       undefined,
       0,
+      undefined,
       undefined,
     );
   }
@@ -266,9 +277,18 @@ export class WagerTransaction {
     return this._nextReferenceCheckAt && new Date(this._nextReferenceCheckAt);
   }
 
-  /** PENDING | PENDING_REFERENCE → PROCESSED. Exige o id interno da referência quando houver referência. */
-  markProcessed(referenceTransactionId: string | undefined, at: Date): void {
+  /** Saldo da wallet observado quando a transação foi decidida (após aplicá-la, se PROCESSED). */
+  get observedBalance(): Money | undefined {
+    return this._observedBalance;
+  }
+
+  /**
+   * PENDING | PENDING_REFERENCE → PROCESSED, guardando o saldo observado após a aplicação.
+   * Exige o id interno da referência quando houver referência.
+   */
+  markProcessed(referenceTransactionId: string | undefined, observedBalance: Money, at: Date): void {
     this.assertNotTerminal('markProcessed');
+    this.assertValidBalance(observedBalance);
     const hasReference = this.referenceExternalTransactionId !== undefined;
     if (hasReference !== (referenceTransactionId !== undefined)) {
       throw new InvalidTransactionStateError(
@@ -279,6 +299,7 @@ export class WagerTransaction {
     }
     this._status = WagerTransactionStatus.Processed;
     this._referenceTransactionId = referenceTransactionId;
+    this._observedBalance = observedBalance;
     this._processedAt = new Date(at);
     this._nextReferenceCheckAt = undefined;
   }
@@ -295,7 +316,8 @@ export class WagerTransaction {
   }
 
   /** PENDING | PENDING_REFERENCE → REJECTED por regra de negócio. */
-  reject(code: FailureCode, referenceTransactionId?: string): void {
+  reject(code: FailureCode, details: RejectionDetails = {}): void {
+    const { referenceTransactionId, observedBalance } = details;
     this.assertNotTerminal('reject');
     if (code === FailureCode.ProcessingError) {
       throw new InvalidTransactionStateError(`${code} is not a business rejection`);
@@ -303,9 +325,13 @@ export class WagerTransaction {
     if (referenceTransactionId !== undefined && this.referenceExternalTransactionId === undefined) {
       throw new InvalidTransactionStateError(`Transaction ${this.id} has no reference to resolve`);
     }
+    if (observedBalance !== undefined) {
+      this.assertValidBalance(observedBalance);
+    }
     this._status = WagerTransactionStatus.Rejected;
     this._failureCode = code;
     this._referenceTransactionId = referenceTransactionId;
+    this._observedBalance = observedBalance;
     this._nextReferenceCheckAt = undefined;
   }
 
@@ -375,6 +401,14 @@ export class WagerTransaction {
         }
         return reference.ledgerDirectionFor() === LedgerDirection.Debit ? LedgerDirection.Credit : LedgerDirection.Debit;
       }
+    }
+  }
+
+  private assertValidBalance(balance: Money): void {
+    if (balance.currency !== this.money.currency || balance.isNegative()) {
+      throw new InvalidTransactionStateError(
+        `Observed balance ${balance} is not a valid ${this.money.currency} balance for transaction ${this.id}`,
+      );
     }
   }
 

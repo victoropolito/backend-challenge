@@ -4,7 +4,7 @@ import {
   type WagerTransaction,
   type WagerTransactionKind,
 } from '../wagering/wager-transaction';
-import type { Money, MoneyProps } from '../shared/money';
+import type { MoneyProps } from '../shared/money';
 import { IntegrationEvent, InvalidIntegrationEventError, type EventContext } from './integration-event';
 
 interface WagerTransactionEventData {
@@ -29,6 +29,7 @@ export interface WagerTransactionProcessedData extends WagerTransactionEventData
 export interface WagerTransactionRejectedData extends WagerTransactionEventData {
   referenceTransactionId: string | null;
   failureCode: FailureCode;
+  balance: MoneyProps | null;
 }
 
 export interface WagerTransactionPendingReferenceData extends WagerTransactionEventData {
@@ -46,15 +47,12 @@ export class WagerTransactionProcessed extends IntegrationEvent<WagerTransaction
     super({ ...ctx, aggregateId: data.transactionId, data });
   }
 
-  static from(transaction: WagerTransaction, balance: Money, ctx: EventContext): WagerTransactionProcessed {
+  static from(transaction: WagerTransaction, ctx: EventContext): WagerTransactionProcessed {
     assertStatus(transaction, WagerTransactionStatus.Processed);
-    if (balance.currency !== transaction.money.currency) {
-      throw new InvalidIntegrationEventError(`Balance currency ${balance.currency} differs from transaction currency`);
-    }
     return new WagerTransactionProcessed(ctx, {
       ...baseData(transaction),
       referenceTransactionId: transaction.referenceTransactionId ?? null,
-      balance: balance.toJSON(),
+      balance: transaction.observedBalance!.toJSON(),
       processedAt: transaction.processedAt!.toISOString(),
     });
   }
@@ -75,6 +73,7 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
       ...baseData(transaction),
       referenceTransactionId: transaction.referenceTransactionId ?? null,
       failureCode: transaction.failureCode!,
+      balance: transaction.observedBalance?.toJSON() ?? null,
     });
   }
 }

@@ -74,7 +74,7 @@ export class CreateWalletUseCase {
       await ledger.insert(openingEntry);
 
       const context = (eventId: string) => ({ eventId, correlationId: command.correlationId, occurredAt: at });
-      await outbox.insert(OutboxMessage.enqueue(WagerTransactionProcessed.from(opening, wallet.balance, context(ids.next()))));
+      await outbox.insert(OutboxMessage.enqueue(WagerTransactionProcessed.from(opening, context(ids.next()))));
       await outbox.insert(OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, openingEntry, context(ids.next()))));
     });
 

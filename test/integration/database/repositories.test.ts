@@ -108,8 +108,8 @@ const persistOpenedWallet = async (initialBalance = brl('100.00'), playerId = ra
 const debitAndPersist = async (manager: EntityManager, wallet: Wallet, amount: Money, expectedVersion = wallet.version) => {
   const { wallets, transactions, ledger } = repositories(manager);
   const bet = newTransaction(wallet.id, { money: amount });
-  bet.markProcessed(undefined, later);
   const entry = wallet.debit({ entryId: randomUUID(), transactionId: bet.id, money: amount, at: later });
+  bet.markProcessed(undefined, wallet.balance, later);
   await transactions.insert(bet);
   await ledger.insert(entry);
   await wallets.update(wallet, expectedVersion);
@@ -267,7 +267,7 @@ describe('MikroOrmWagerTransactionRepository', () => {
     const { transactions } = repositories();
     const { wallet } = await persistOpenedWallet(Money.zero('BRL'));
     const bet = newTransaction(wallet.id);
-    bet.markProcessed(undefined, later);
+    bet.markProcessed(undefined, brl('100.00'), later);
     await transactions.insert(bet);
 
     const refund = newTransaction(wallet.id, { kind: Kind.Refund, referenceExternalTransactionId: bet.externalTransactionId });
@@ -277,7 +277,7 @@ describe('MikroOrmWagerTransactionRepository', () => {
     await transactions.update(refund);
     expect(await transactions.findById(refund.id)).toEqual(refund);
 
-    refund.markProcessed(bet.id, later);
+    refund.markProcessed(bet.id, brl('100.00'), later);
     await transactions.update(refund);
     const stored = await transactions.findById(refund.id);
     expect(stored).toEqual(refund);
@@ -318,12 +318,12 @@ describe('MikroOrmWagerTransactionRepository', () => {
     const { transactions } = repositories();
     const walletId = randomUUID();
     const bet = newTransaction(walletId);
-    bet.markProcessed(undefined, at);
+    bet.markProcessed(undefined, brl('100.00'), at);
     await transactions.insert(bet);
 
     const reversal = (kind: Kind.Refund | Kind.Rollback) => {
       const t = newTransaction(walletId, { kind, referenceExternalTransactionId: bet.externalTransactionId });
-      t.markProcessed(bet.id, at);
+      t.markProcessed(bet.id, brl('100.00'), at);
       return t;
     };
     await transactions.insert(reversal(Kind.Refund));
@@ -335,7 +335,7 @@ describe('MikroOrmWagerTransactionRepository', () => {
 
     const pending = newTransaction(walletId, { kind: Kind.Rollback, referenceExternalTransactionId: bet.externalTransactionId });
     await transactions.insert(pending);
-    pending.markProcessed(bet.id, at);
+    pending.markProcessed(bet.id, brl('100.00'), at);
     const updateError = await transactions.update(pending).catch((e: unknown) => e);
     expect((updateError as DuplicateWagerTransactionError).conflict).toBe('REVERSAL');
   });

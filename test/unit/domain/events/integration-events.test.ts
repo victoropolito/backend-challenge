@@ -57,8 +57,8 @@ const openWallet = () =>
 describe('IntegrationEvent envelope', () => {
   it('serializes the envelope with ISO date, type and version', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const event = WagerTransactionProcessed.from(tx, brl('975.00'), ctx);
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const event = WagerTransactionProcessed.from(tx, ctx);
 
     expect(event.toJSON()).toEqual({
       eventId: 'event-1',
@@ -74,23 +74,23 @@ describe('IntegrationEvent envelope', () => {
 
   it('omits causationId when absent', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const json = WagerTransactionProcessed.from(tx, brl('975.00'), { ...ctx, causationId: undefined }).toJSON();
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const json = WagerTransactionProcessed.from(tx, { ...ctx, causationId: undefined }).toJSON();
     expect('causationId' in json).toBe(false);
   });
 
   it('round-trips through JSON as plain data, never Money instances', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const event = WagerTransactionProcessed.from(tx, brl('975.00'), ctx);
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const event = WagerTransactionProcessed.from(tx, ctx);
     expect(JSON.parse(JSON.stringify(event))).toEqual(event.toJSON());
     expect(event.data.money).toEqual({ amount: '25.00', currency: 'BRL' });
   });
 
   it('has deeply immutable data', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const event = WagerTransactionProcessed.from(tx, brl('975.00'), ctx);
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const event = WagerTransactionProcessed.from(tx, ctx);
     expect(Object.isFrozen(event.data)).toBe(true);
     expect(Object.isFrozen(event.data.money)).toBe(true);
     expect(() => {
@@ -100,8 +100,8 @@ describe('IntegrationEvent envelope', () => {
 
   it('toJSON returns a copy that does not affect the event', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const event = WagerTransactionProcessed.from(tx, brl('975.00'), ctx);
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const event = WagerTransactionProcessed.from(tx, ctx);
     const json = event.toJSON();
     json.data.money.amount = '0.00';
     expect(event.data.money.amount).toBe('25.00');
@@ -109,8 +109,8 @@ describe('IntegrationEvent envelope', () => {
 
   it.each(['eventId', 'correlationId'] as const)('rejects an empty %s', (field) => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    expect(() => WagerTransactionProcessed.from(tx, brl('975.00'), { ...ctx, [field]: '' })).toThrow(
+    tx.markProcessed(undefined, brl('975.00'), at);
+    expect(() => WagerTransactionProcessed.from(tx, { ...ctx, [field]: '' })).toThrow(
       InvalidIntegrationEventError,
     );
   });
@@ -119,8 +119,8 @@ describe('IntegrationEvent envelope', () => {
 describe('WagerTransactionProcessed', () => {
   it('carries the transaction and the observed balance', () => {
     const tx = transaction();
-    tx.markProcessed(undefined, at);
-    const event = WagerTransactionProcessed.from(tx, brl('975.00'), ctx);
+    tx.markProcessed(undefined, brl('975.00'), at);
+    const event = WagerTransactionProcessed.from(tx, ctx);
 
     expect(event.data).toEqual({
       transactionId: 'tx-1',
@@ -141,28 +141,20 @@ describe('WagerTransactionProcessed', () => {
 
   it('is emitted for LOSS too', () => {
     const tx = transaction({ kind: Kind.Loss, money: Money.zero('BRL') });
-    tx.markProcessed(undefined, at);
-    expect(WagerTransactionProcessed.from(tx, brl('1000.00'), ctx).data.kind).toBe(Kind.Loss);
+    tx.markProcessed(undefined, brl('1000.00'), at);
+    expect(WagerTransactionProcessed.from(tx, ctx).data.kind).toBe(Kind.Loss);
   });
 
   it('includes the resolved reference', () => {
     const tx = transaction({ kind: Kind.Refund, referenceExternalTransactionId: 'ext-0' });
-    tx.markProcessed('tx-0', at);
-    const { data } = WagerTransactionProcessed.from(tx, brl('1025.00'), ctx);
+    tx.markProcessed('tx-0', brl('1025.00'), at);
+    const { data } = WagerTransactionProcessed.from(tx, ctx);
     expect(data.referenceExternalTransactionId).toBe('ext-0');
     expect(data.referenceTransactionId).toBe('tx-0');
   });
 
   it('requires a PROCESSED transaction', () => {
-    expect(() => WagerTransactionProcessed.from(transaction(), brl('975.00'), ctx)).toThrow(InvalidIntegrationEventError);
-  });
-
-  it('requires the balance in the transaction currency', () => {
-    const tx = transaction();
-    tx.markProcessed(undefined, at);
-    expect(() => WagerTransactionProcessed.from(tx, Money.from({ amount: '1.00', currency: 'USD' }), ctx)).toThrow(
-      InvalidIntegrationEventError,
-    );
+    expect(() => WagerTransactionProcessed.from(transaction(), ctx)).toThrow(InvalidIntegrationEventError);
   });
 });
 
@@ -176,6 +168,18 @@ describe('WagerTransactionRejected', () => {
     expect(event.aggregateId).toBe('tx-1');
     expect(event.data.failureCode).toBe(FailureCode.InsufficientBalance);
     expect(event.data.referenceTransactionId).toBeNull();
+  });
+
+  it('carries the observed balance when there is one', () => {
+    const tx = transaction();
+    tx.reject(FailureCode.InsufficientBalance, { observedBalance: brl('10.00') });
+    expect(WagerTransactionRejected.from(tx, ctx).data.balance).toEqual({ amount: '10.00', currency: 'BRL' });
+  });
+
+  it('has a null balance when none was observed', () => {
+    const tx = transaction();
+    tx.reject(FailureCode.WalletNotFound);
+    expect(WagerTransactionRejected.from(tx, ctx).data.balance).toBeNull();
   });
 
   it('requires a REJECTED transaction', () => {
