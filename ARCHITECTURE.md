@@ -15,11 +15,12 @@ src/
 │   └── messaging/          InboxMessage, OutboxMessage, portas de repositório
 ├── infrastructure/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
-│   ├── messaging/          cliente SQS
+│   ├── messaging/          cliente SQS e publisher de eventos (SqsEventPublisher)
 │   └── system/             relógio do sistema e gerador de UUIDv7
 ├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
 ├── http/                   controllers, validação (Zod), correlation id, filtro de erros
 ├── consumer/               consumidor SQS: leitura das mensagens, classificação de falhas, loop, DLQ, shutdown
+├── workers/                processos em segundo plano: publisher da outbox
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
@@ -37,7 +38,7 @@ Princípio geral: **o banco é a última linha de defesa.** Toda invariante fina
 | Framework | NestJS |
 | Banco | PostgreSQL 16 |
 | ORM | MikroORM 7 (preferencial no enunciado) |
-| Mensageria | AWS SQS via LocalStack 3.8 (filas FIFO + DLQ com `maxReceiveCount = 5`) |
+| Mensageria | AWS SQS via LocalStack 3.8: fila FIFO de transações + DLQ (`maxReceiveCount = 5`) e fila FIFO de eventos |
 | Config | Zod: falha rápida no boot se o ambiente for inválido |
 
 ## 3. Domínio
@@ -278,7 +279,48 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 - **Configuração:** `SQS_CONSUMER_ENABLED`, `SQS_CONSUMER_WAIT_TIME_SECONDS`, `SQS_CONSUMER_BATCH_SIZE`, `SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS`, `SQS_CONSUMER_MAX_ATTEMPTS`, `SQS_CONSUMER_RETRY_BASE_DELAY_MS`, `SQS_CONSUMER_RETRY_MAX_DELAY_MS`, `SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS`.
 - No boot, as URLs das filas são resolvidas pelo nome. Se o SQS ainda não estiver acessível, o módulo tenta de novo a cada 2 s, sem impedir a API de subir.
 
-## 9. Interpretações adotadas
+## 9. Publicação de eventos (outbox)
+
+### 9.1 Destino
+
+O enunciado não define para onde os eventos vão. Eles são publicados na fila **FIFO `wagering-events.fifo`**, criada pelo script de init do LocalStack junto com as outras, para não acrescentar outro serviço (SNS, Kafka) à stack:
+
+- corpo = envelope do evento (`toJSON()` gravado no `payload` da outbox), sem transformação;
+- `MessageGroupId` = `aggregateId` (transação ou wallet);
+- `MessageDeduplicationId` = `eventId`: o SQS descarta uma republicação do mesmo evento dentro de 5 min;
+- atributos `eventType` e `eventId`, para filtrar sem abrir o corpo.
+
+Ninguém consome essa fila neste projeto; ela representa o destino dos sistemas downstream. Trocar o destino é implementar outra `EventPublisher` (porta da aplicação).
+
+### 9.2 Algoritmo
+
+Cada lote é **uma transação SQL** (`PublishOutboxUseCase`):
+
+1. `claimDue`: `SELECT ... FROM outbox_messages WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= now) ORDER BY next_attempt_at NULLS FIRST, sequence LIMIT n FOR UPDATE SKIP LOCKED`, usando o índice parcial de pendentes. Mensagens travadas por outro publisher são **puladas**, e não esperadas: publishers concorrentes dividem a outbox sem disputa.
+2. Publica as mensagens travadas (`SendMessageBatch`, até 10 por chamada, com timeout de 5 s).
+3. Na mesma transação, marca as aceitas como publicadas (`markPublished`) e agenda nova tentativa para as recusadas (`scheduleRetry`: 1 s, 2 s, 4 s… até 5 min, **sem limite**, porque um evento confirmado não pode ser descartado).
+4. Commit, que libera as travas.
+
+**Por que manter a trava durante a publicação**, em vez de marcar um "lease" e soltar a transação: se o processo morrer, o PostgreSQL desfaz a transação e libera as linhas na hora, e outro publisher as pega no lote seguinte. Não há prazo de lease a calibrar nem coluna extra. O custo é uma conexão e uma transação abertas durante a chamada ao SQS, limitada pelo timeout.
+
+### 9.3 Garantias
+
+- **Nada é publicado antes do commit:** o publisher só lê linhas confirmadas da outbox, e a outbox é gravada na mesma transação da mudança de estado.
+- **Nada confirmado se perde:** uma linha só sai de pendente quando o SQS aceitou a mensagem e a marcação foi confirmada.
+- **Entrega pelo menos uma vez, com duplicata possível e segura:** se o processo morrer (ou a chamada estourar o timeout) depois de o SQS aceitar e antes do commit, o lote volta a pendente e é republicado **com o mesmo `eventId`**. Dentro de 5 min o próprio SQS FIFO descarta a cópia; depois disso o consumidor deduplica pelo `eventId`.
+- Cenário do enunciado: (1) o PostgreSQL confirma; (2) o processo morre antes de publicar; (3) qualquer outra instância, no próximo lote, encontra as linhas pendentes, que não estão travadas por ninguém; (4) publica; (5) a republicação eventual tem o mesmo `eventId`.
+
+### 9.4 Worker
+
+`OutboxPublisherWorker`, ligado ao NestJS por `OutboxPublisherModule`, roda em todas as instâncias:
+
+- repete lotes sem pausa enquanto eles vêm cheios; quando a outbox esvazia, ou houve falha, espera `OUTBOX_IDLE_DELAY_MS` (500 ms);
+- erro inesperado no lote (banco fora, por exemplo) é registrado, e o loop continua depois da espera;
+- no shutdown, interrompe a espera e conclui o lote em andamento, que dura no máximo o timeout da publicação.
+
+Configuração: `SQS_EVENTS_QUEUE_NAME`, `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_BATCH_SIZE` (10), `OUTBOX_IDLE_DELAY_MS` (500), `OUTBOX_PUBLISH_TIMEOUT_MS` (5000). O readiness também confere a fila de eventos.
+
+## 10. Interpretações adotadas
 
 | Tema | Interpretação | Motivo |
 |---|---|---|
@@ -293,8 +335,11 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 | Mesmo `externalTransactionId` com outra idempotency key | Conflito, não replay | O header é a fonte da verdade da idempotência |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
 
-## 10. Limitações conhecidas
+## 11. Limitações conhecidas
 
+- **Ordem dos eventos entre publishers:** um lote é publicado na ordem de gravação, mas dois publishers podem pegar eventos consecutivos do mesmo agregado em lotes diferentes, e o segundo lote pode chegar antes. Os consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e `occurredAt` para ordenar, e não a ordem de chegada.
+- Linhas publicadas da outbox não são apagadas: a tabela cresce sem limite. Uma rotina de limpeza (apagar publicadas com mais de N dias) fica para depois.
+- Um evento que o SQS recusa sempre (por exemplo, corpo acima de 256 KB) fica sendo tentado para sempre, a cada 5 min. É o comportamento desejado para não perder evento; o sinal para agir é a métrica de atraso da outbox (planejada).
 - O consumidor não estende a visibilidade durante o processamento (sem *heartbeat*): uma mensagem que demore mais que o `VisibilityTimeout` (30 s) pode ser entregue a outra instância ao mesmo tempo. Isso é seguro (inbox, lock e idempotência), mas gasta trabalho; o processamento normal leva milissegundos.
 - Cada instância tem um único loop de recebimento: o próximo lote só é pedido depois que o anterior termina. O paralelismo vem dos grupos dentro do lote e do número de instâncias.
 - Devolver a visibilidade no shutdown conta como uma entrega a mais (`ApproximateReceiveCount`), e reinícios seguidos podem aproximar uma mensagem do limite da DLQ.
@@ -305,15 +350,16 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
 - O status `FAILED`/`PROCESSING_ERROR` ainda não é produzido: erros de infraestrutura desfazem a transação SQL inteira e são repetidos (HTTP 503 ou nova entrega da fila). Ver a seção 8.3.
 
-## 11. Testes
+## 12. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
 - **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
 - **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP. O consumo de mensagens é testado no banco real: inbox gravada com o desfecho, redelivery como duplicata, mesmo `messageId` com outro conteúdo, reenvio com outro `messageId` como replay, rejeição e `PENDING_REFERENCE` registrados, conflito sem inbox, rollback da inbox junto com transação, ledger e eventos (falha injetada na outbox), a mesma mensagem 20 vezes em paralelo e 50 mensagens diferentes para a mesma transação em paralelo (um único débito).
 - **Consumidor SQS no LocalStack real** (filas FIFO e DLQ descartáveis por teste, com a mesma `RedrivePolicy`): aplicação e confirmação após o commit, rejeição de negócio confirmada sem retry, redelivery e reenvio aplicados uma vez, mensagem já commitada antes de um "crash" confirmada sem reaplicar, mensagem malformada e conflito de idempotência direto para a DLQ com os atributos de falha, falha transitória repetida com backoff até dar certo, tentativas esgotadas indo para a DLQ, ordem dentro do grupo com grupos em paralelo, shutdown que espera a mensagem em andamento e para de receber, e timeout de shutdown que devolve a visibilidade (outra instância processa logo, sem esperar os 30 s). Mais um teste sobe a aplicação Nest real com o consumidor ligado pela config e o para no `close()`. Mutações conferidas: sem devolver a visibilidade e sem ordem por grupo, os testes falham.
 - **Shutdown com `SIGTERM` real** (`scripts/sigterm-check.sh`, manual): a aplicação num container Linux recebe `docker stop` no meio de uma rajada de mensagens; o script confere transações = ledger = inbox e saldos corretos logo depois do sinal e, após o restart, que tudo foi aplicado exatamente uma vez. Ver `docs/execucao-e-validacao.md` §7.
+- **Outbox:** o caso de uso de publicação é testado no banco real com um publisher em memória: ordem de gravação, tamanho do lote, mensagens ainda não vencidas puladas, recusa parcial com backoff, destino fora do ar com nova tentativa depois, um segundo publisher pulando as linhas travadas pelo primeiro, 5 publishers concorrentes sobre 200 mensagens (cada uma publicada exatamente uma vez) e morte depois de publicar e antes do commit (republicação com o mesmo id). O `SqsEventPublisher` e o worker são testados no LocalStack real: formato da mensagem, deduplicação pelo `eventId`, fila inexistente, eventos gravados com nenhum publisher no ar sendo publicados depois, 3 workers simultâneos (cada evento recebido uma vez) e parada rápida. Mutações conferidas: sem a trava, há publicação duplicada; com `FOR UPDATE` sem `SKIP LOCKED`, os publishers ficam esperando uns pelos outros.
 - Nenhum mock de banco nem de fila. **Planejado:** testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
-## 12. Pendências
+## 13. Pendências
 
-Publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

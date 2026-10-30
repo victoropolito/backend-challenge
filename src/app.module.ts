@@ -5,8 +5,9 @@ import { SqsModule } from './infrastructure/messaging/sqs.module';
 import { HealthModule } from './health/health.module';
 import { ApiModule } from './http/api.module';
 import { ConsumerModule } from './consumer/consumer.module';
+import { OutboxPublisherModule } from './workers/outbox-publisher.module';
 
 @Module({
-  imports: [ConfigModule, DatabaseModule, SqsModule, ApiModule, ConsumerModule, HealthModule],
+  imports: [ConfigModule, DatabaseModule, SqsModule, ApiModule, ConsumerModule, OutboxPublisherModule, HealthModule],
 })
 export class AppModule {}

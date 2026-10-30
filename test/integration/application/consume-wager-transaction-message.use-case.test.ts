@@ -63,6 +63,7 @@ beforeAll(async () => {
 
   const failingOutbox = new (class extends OutboxRepository {
     findById = outbox.findById.bind(outbox);
+    claimDue = outbox.claimDue.bind(outbox);
     update = outbox.update.bind(outbox);
     async insert(message: OutboxMessage): Promise<void> {
       if (message.eventType === 'WalletBalanceChanged') {

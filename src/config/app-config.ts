@@ -14,6 +14,7 @@ const EnvSchema = z.object({
 
   SQS_WAGER_QUEUE_NAME: z.string().endsWith('.fifo').default('wager-transactions.fifo'),
   SQS_WAGER_DLQ_NAME: z.string().endsWith('.fifo').default('wager-transactions-dlq.fifo'),
+  SQS_EVENTS_QUEUE_NAME: z.string().endsWith('.fifo').default('wagering-events.fifo'),
 
   SQS_CONSUMER_ENABLED: z.stringbool().default(true),
   SQS_CONSUMER_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).default(10),
@@ -23,6 +24,11 @@ const EnvSchema = z.object({
   SQS_CONSUMER_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(0).default(1_000),
   SQS_CONSUMER_RETRY_MAX_DELAY_MS: z.coerce.number().int().min(0).max(43_200_000).default(60_000),
   SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(20_000),
+
+  OUTBOX_PUBLISHER_ENABLED: z.stringbool().default(true),
+  OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(10),
+  OUTBOX_IDLE_DELAY_MS: z.coerce.number().int().min(10).default(500),
+  OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(100).default(5_000),
 });
 
 export interface AppConfig {
@@ -40,6 +46,7 @@ export interface AppConfig {
   readonly sqs: {
     readonly wagerQueueName: string;
     readonly wagerDlqName: string;
+    readonly eventsQueueName: string;
   };
   readonly consumer: {
     readonly enabled: boolean;
@@ -49,6 +56,12 @@ export interface AppConfig {
     readonly maxAttempts: number;
     readonly retryPolicy: { readonly baseDelayMs: number; readonly maxDelayMs: number };
     readonly shutdownTimeoutMs: number;
+  };
+  readonly outbox: {
+    readonly enabled: boolean;
+    readonly batchSize: number;
+    readonly idleDelayMs: number;
+    readonly publishTimeoutMs: number;
   };
 }
 
@@ -84,7 +97,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         ? { accessKeyId: e.AWS_ACCESS_KEY_ID!, secretAccessKey: e.AWS_SECRET_ACCESS_KEY! }
         : undefined,
     },
-    sqs: { wagerQueueName: e.SQS_WAGER_QUEUE_NAME, wagerDlqName: e.SQS_WAGER_DLQ_NAME },
+    sqs: {
+      wagerQueueName: e.SQS_WAGER_QUEUE_NAME,
+      wagerDlqName: e.SQS_WAGER_DLQ_NAME,
+      eventsQueueName: e.SQS_EVENTS_QUEUE_NAME,
+    },
     consumer: {
       enabled: e.SQS_CONSUMER_ENABLED,
       waitTimeSeconds: e.SQS_CONSUMER_WAIT_TIME_SECONDS,
@@ -93,6 +110,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxAttempts: e.SQS_CONSUMER_MAX_ATTEMPTS,
       retryPolicy: { baseDelayMs: e.SQS_CONSUMER_RETRY_BASE_DELAY_MS, maxDelayMs: e.SQS_CONSUMER_RETRY_MAX_DELAY_MS },
       shutdownTimeoutMs: e.SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS,
+    },
+    outbox: {
+      enabled: e.OUTBOX_PUBLISHER_ENABLED,
+      batchSize: e.OUTBOX_BATCH_SIZE,
+      idleDelayMs: e.OUTBOX_IDLE_DELAY_MS,
+      publishTimeoutMs: e.OUTBOX_PUBLISH_TIMEOUT_MS,
     },
   };
 }

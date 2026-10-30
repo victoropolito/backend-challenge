@@ -20,14 +20,14 @@ bun run infra:up              # sobe PostgreSQL e LocalStack e espera os healthc
 bun run migration:up          # aplica as migrations no banco de dev
 ```
 
-- `infra:up` = `docker compose up -d --wait`. O LocalStack só fica *healthy* depois que o script `docker/localstack/init/ready.d/01-create-queues.sh` cria as filas `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (`RedrivePolicy` com `maxReceiveCount = 5`, `VisibilityTimeout` de 30 s).
+- `infra:up` = `docker compose up -d --wait`. O LocalStack só fica *healthy* depois que o script `docker/localstack/init/ready.d/01-create-queues.sh` cria as filas `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (`RedrivePolicy` com `maxReceiveCount = 5`, `VisibilityTimeout` de 30 s) e a fila de eventos `wagering-events.fifo`, para onde a outbox publica.
 - `infra:down` para os containers e mantém os dados; `infra:reset` apaga o volume do PostgreSQL e sobe tudo de novo (depois, rode `migration:up` outra vez). As filas do LocalStack não são persistidas: são recriadas a cada subida.
 
 Conferir:
 
 ```bash
 docker compose ps                                              # os dois serviços "healthy"
-docker compose exec -T localstack awslocal sqs list-queues     # as duas filas
+docker compose exec -T localstack awslocal sqs list-queues     # as três filas
 bun run migration:pending                                      # "No pending migrations"
 ```
 
@@ -39,7 +39,7 @@ curl localhost:3000/health/live     # 200 {"status":"ok"}
 curl localhost:3000/health/ready    # 200 com postgres e sqs "up"; 503 se algum estiver fora
 ```
 
-A aplicação sobe a API HTTP e o consumidor da fila no mesmo processo. Variáveis principais (todas em `.env.example`):
+A aplicação sobe a API HTTP, o consumidor da fila e o publisher da outbox no mesmo processo. Variáveis principais (todas em `.env.example`):
 
 | Variável | Padrão | Efeito |
 |---|---|---|
@@ -51,6 +51,10 @@ A aplicação sobe a API HTTP e o consumidor da fila no mesmo processo. Variáve
 | `SQS_CONSUMER_MAX_ATTEMPTS` | `5` | entregas antes de mandar uma falha transitória para a DLQ (não deve passar do `maxReceiveCount` da fila) |
 | `SQS_CONSUMER_RETRY_BASE_DELAY_MS` / `_MAX_DELAY_MS` | `1000` / `60000` | backoff entre tentativas |
 | `SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS` | `20000` | quanto o shutdown espera as mensagens em andamento antes de devolvê-las à fila |
+| `SQS_EVENTS_QUEUE_NAME` | `wagering-events.fifo` | fila onde os eventos da outbox são publicados |
+| `OUTBOX_PUBLISHER_ENABLED` | `true` | liga o publisher da outbox |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_IDLE_DELAY_MS` | `10` / `500` | mensagens por lote; espera quando a outbox está vazia |
+| `OUTBOX_PUBLISH_TIMEOUT_MS` | `5000` | limite de cada chamada ao SQS (a transação do lote fica aberta durante a publicação) |
 
 ## 4. Testes automatizados
 
@@ -61,7 +65,7 @@ bun run test:unit             # só unitários (sem infra)
 bun run test:integration      # PostgreSQL e LocalStack reais
 ```
 
-Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes do consumidor criam filas `wager-test-<aleatório>.fifo` + DLQ (removidas no fim de cada teste). Os testes HTTP desligam o consumidor.
+Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes de mensageria criam filas `wager-test-<aleatório>.fifo` + DLQ + eventos (removidas no fim). Os testes HTTP desligam o consumidor e o publisher da outbox.
 
 ## 5. Validação manual da API
 
@@ -120,6 +124,21 @@ docker compose exec -T localstack awslocal sqs receive-message --queue-url $DLQ 
 
 O log da aplicação mostra `Message ... sent to the DLQ (PERMANENT): MALFORMED_MESSAGE: ...`.
 
+### Eventos publicados
+
+Cada transação aplicada, rejeitada ou pendente gera eventos na outbox, que o publisher envia à fila `wagering-events.fifo` em até ~0,5 s. Para ver os eventos e conferir que a outbox esvaziou:
+
+```bash
+EVENTS=http://localhost:4566/000000000000/wagering-events.fifo
+docker compose exec -T localstack awslocal sqs receive-message --queue-url $EVENTS \
+  --max-number-of-messages 10 --visibility-timeout 0 --message-attribute-names All \
+  --query 'Messages[].[MessageAttributes.eventType.StringValue, Body]' --output text
+docker compose exec -T postgres psql -U wagering -d wagering -tAc \
+  "select count(*) filter (where published_at is null) as pendentes, count(*) as total from outbox_messages"
+```
+
+Esperado: `pendentes = 0` com a aplicação no ar. Ninguém consome a fila de eventos neste projeto, então ela acumula mensagens (o LocalStack não persiste nada entre reinícios). Com a aplicação parada, os eventos de transações novas ficam pendentes na outbox e são publicados assim que alguma instância sobe.
+
 ## 7. Shutdown com `SIGTERM` real
 
 O processamento de uma mensagem leva milissegundos, então matar a aplicação à mão quase nunca pega uma mensagem em andamento. O script `scripts/sigterm-check.sh` provoca a situação e confere o resultado:
@@ -173,6 +192,7 @@ Cada execução deixa no banco de dev as wallets e transações marcadas com `si
 | `infra:up` falha com `port is already allocated` (5432 ou 4566) | outro PostgreSQL/LocalStack na máquina | parar o outro serviço, ou mudar a porta no `docker-compose.yml` e no `.env` |
 | LocalStack nunca fica *healthy* | o script de criação das filas não rodou (sem permissão de execução ou com fim de linha CRLF) | `git ls-files -s docker/localstack/init/ready.d/01-create-queues.sh` deve mostrar `100755`; o `.gitattributes` força LF. Depois, `bun run infra:reset` |
 | `/health/ready` → 503 | PostgreSQL ou LocalStack fora (o corpo diz qual) | `bun run infra:up`; volta sozinho a 200 quando a dependência volta |
+| `/health/ready` → 503 com `sqs` fora, logo depois de atualizar o código, e log `Event ... not published, will retry: The specified queue does not exist` | o LocalStack em execução foi criado antes da fila de eventos existir no script de init | `docker compose up -d --force-recreate --wait localstack` (ou `bun run infra:reset`) |
 | erro `relation "wallets" does not exist` | migrations não aplicadas no banco de dev | `bun run migration:up` |
 | testes falham com `ECONNREFUSED` | infra fora do ar | `bun run infra:up` (os unitários rodam sem infra: `bun run test:unit`) |
 | sobraram bancos `wagering_test_*` ou filas `wager-test-*` (testes interrompidos no meio) | a limpeza do fim do teste não rodou | ver os comandos logo abaixo |

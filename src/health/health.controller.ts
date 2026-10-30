@@ -31,9 +31,9 @@ export class HealthController {
         await this.orm.em.getConnection().execute('select 1');
       }),
       this.check(async () => {
-        const { wagerQueueName, wagerDlqName } = this.config.sqs;
+        const { wagerQueueName, wagerDlqName, eventsQueueName } = this.config.sqs;
         await Promise.all(
-          [wagerQueueName, wagerDlqName].map((QueueName) => this.sqs.send(new GetQueueUrlCommand({ QueueName }))),
+          [wagerQueueName, wagerDlqName, eventsQueueName].map((QueueName) => this.sqs.send(new GetQueueUrlCommand({ QueueName }))),
         );
       }),
     ]);

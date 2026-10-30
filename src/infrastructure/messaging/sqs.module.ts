@@ -1,6 +1,8 @@
 import { Global, Inject, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { SQSClient } from '@aws-sdk/client-sqs';
+import { EventPublisher } from '../../application/messaging/event-publisher';
 import { APP_CONFIG, type AppConfig } from '../../config/app-config';
+import { SqsEventPublisher } from './sqs-event-publisher';
 
 @Global()
 @Module({
@@ -15,8 +17,17 @@ import { APP_CONFIG, type AppConfig } from '../../config/app-config';
           ...(config.aws.credentials !== undefined && { credentials: config.aws.credentials }),
         }),
     },
+    {
+      provide: EventPublisher,
+      inject: [SQSClient, APP_CONFIG],
+      useFactory: (sqs: SQSClient, config: AppConfig) =>
+        new SqsEventPublisher(sqs, {
+          queueName: config.sqs.eventsQueueName,
+          timeoutMs: config.outbox.publishTimeoutMs,
+        }),
+    },
   ],
-  exports: [SQSClient],
+  exports: [SQSClient, EventPublisher],
 })
 export class SqsModule implements OnApplicationShutdown {
   constructor(@Inject(SQSClient) private readonly sqs: SQSClient) {}

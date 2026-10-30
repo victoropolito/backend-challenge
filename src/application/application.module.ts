@@ -4,6 +4,8 @@ import { WagerTransactionRepository } from '../domain/wagering/wager-transaction
 import { LedgerRepository, WalletRepository } from '../domain/wallet/wallet-repository';
 import { SystemClock } from '../infrastructure/system/system-clock';
 import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
+import { EventPublisher } from './messaging/event-publisher';
+import { PublishOutboxUseCase } from './messaging/publish-outbox.use-case';
 import { Clock } from './shared/clock';
 import { IdGenerator } from './shared/id-generator';
 import { TransactionRunner } from './shared/transaction-runner';
@@ -51,6 +53,12 @@ const USE_CASES: Provider[] = [
       clock: Clock,
       ids: IdGenerator,
     ) => new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids }),
+  },
+  {
+    provide: PublishOutboxUseCase,
+    inject: [TransactionRunner, OutboxRepository, EventPublisher, Clock],
+    useFactory: (transactions: TransactionRunner, outbox: OutboxRepository, publisher: EventPublisher, clock: Clock) =>
+      new PublishOutboxUseCase({ transactions, outbox, publisher, clock }),
   },
   {
     provide: ConsumeWagerTransactionMessageUseCase,

@@ -210,6 +210,9 @@ describe('CreateWalletUseCase', () => {
       findById(id: string) {
         return realOutbox.findById(id);
       }
+      claimDue(now: Date, limit: number) {
+        return realOutbox.claimDue(now, limit);
+      }
       async insert(message: OutboxMessage) {
         await realOutbox.insert(message);
         inserted += 1;

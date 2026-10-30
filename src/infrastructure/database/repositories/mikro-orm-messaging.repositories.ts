@@ -1,3 +1,4 @@
+import { LockMode, QueryOrder } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { InboxMessage } from '../../../domain/messaging/inbox-message';
 import {
@@ -59,6 +60,20 @@ export class MikroOrmOutboxRepository extends OutboxRepository {
   async findById(id: string): Promise<OutboxMessage | undefined> {
     const record = await this.em.findOne(OutboxMessageSchema, { id }, { disableIdentityMap: true });
     return record ? toOutboxMessage(record) : undefined;
+  }
+
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    const records = await this.em.find(
+      OutboxMessageSchema,
+      { publishedAt: null, $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] },
+      {
+        orderBy: { nextAttemptAt: QueryOrder.ASC_NULLS_FIRST, sequence: QueryOrder.ASC },
+        limit,
+        lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
+        disableIdentityMap: true,
+      },
+    );
+    return records.map(toOutboxMessage);
   }
 
   async insert(message: OutboxMessage): Promise<void> {

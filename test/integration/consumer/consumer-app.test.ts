@@ -9,6 +9,7 @@ const ENV_KEYS = [
   'DATABASE_URL',
   'SQS_WAGER_QUEUE_NAME',
   'SQS_WAGER_DLQ_NAME',
+  'SQS_EVENTS_QUEUE_NAME',
   'SQS_CONSUMER_ENABLED',
   'SQS_CONSUMER_WAIT_TIME_SECONDS',
 ] as const;
@@ -25,6 +26,7 @@ beforeAll(async () => {
     DATABASE_URL: db.url,
     SQS_WAGER_QUEUE_NAME: queues.queueName,
     SQS_WAGER_DLQ_NAME: queues.dlqName,
+    SQS_EVENTS_QUEUE_NAME: queues.eventsQueueName,
     SQS_CONSUMER_ENABLED: 'true',
     SQS_CONSUMER_WAIT_TIME_SECONDS: '1',
   });
@@ -45,8 +47,8 @@ afterAll(async () => {
   await db?.drop();
 });
 
-describe('consumer in the application', () => {
-  it('consumes the configured queue with the same use case as the API, and stops on close', async () => {
+describe('consumer and outbox publisher in the application', () => {
+  it('consumes the configured queue with the same use case as the API, publishes the events, and stops on close', async () => {
     const baseUrl = (await app!.getUrl()).replace('[::1]', 'localhost');
     const created = await fetch(`${baseUrl}/wallets`, {
       method: 'POST',
@@ -82,6 +84,15 @@ describe('consumer in the application', () => {
       expect(await response.json()).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00', currency: 'BRL' } });
     });
     await eventually(async () => expect(await queues.countMain()).toBe(0));
+
+    const events: { eventType: string; data: { externalTransactionId?: string } }[] = [];
+    await eventually(async () => {
+      events.push(...(await queues.drainEvents()).map((item) => JSON.parse(item.Body!)));
+      expect(
+        events.filter((event) => event.data.externalTransactionId === externalTransactionId).map((event) => event.eventType),
+      ).toEqual(['WagerTransactionProcessed']);
+      expect(events.filter((event) => event.eventType === 'WalletBalanceChanged')).toHaveLength(2);
+    });
 
     const closing = Date.now();
     await app!.close();

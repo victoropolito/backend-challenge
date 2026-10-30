@@ -1,9 +1,10 @@
 #!/bin/bash
-# Cria a fila principal FIFO e sua DLQ.
+# Cria a fila FIFO de transações com sua DLQ e a fila FIFO de eventos publicados pela outbox.
 set -euo pipefail
 
 MAIN_QUEUE="wager-transactions.fifo"
 DLQ_QUEUE="wager-transactions-dlq.fifo"
+EVENTS_QUEUE="wagering-events.fifo"
 MAX_RECEIVE_COUNT=5
 
 DLQ_URL=$(awslocal sqs create-queue \
@@ -29,4 +30,6 @@ print(json.dumps({
 
 awslocal sqs create-queue --queue-name "$MAIN_QUEUE" --attributes "$ATTRIBUTES" >/dev/null
 
-echo "SQS ready: $MAIN_QUEUE -> $DLQ_QUEUE (maxReceiveCount=$MAX_RECEIVE_COUNT)"
+awslocal sqs create-queue --queue-name "$EVENTS_QUEUE" --attributes FifoQueue=true,ContentBasedDeduplication=false >/dev/null
+
+echo "SQS ready: $MAIN_QUEUE -> $DLQ_QUEUE (maxReceiveCount=$MAX_RECEIVE_COUNT), $EVENTS_QUEUE"

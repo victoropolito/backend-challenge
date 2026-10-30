@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   CreateQueueCommand,
+  DeleteMessageBatchCommand,
   DeleteQueueCommand,
   GetQueueAttributesCommand,
   ReceiveMessageCommand,
@@ -16,18 +17,22 @@ export interface TestQueues {
   readonly dlqName: string;
   readonly queueUrl: string;
   readonly dlqUrl: string;
+  readonly eventsQueueName: string;
+  readonly eventsUrl: string;
   /** Publica um corpo na fila principal, com deduplicação explícita (cada chamada é uma mensagem nova). */
   send(body: unknown, groupId: string): Promise<void>;
   /** Mensagens visíveis + em processamento + atrasadas na fila principal. */
   countMain(): Promise<number>;
   /** Lê (sem apagar) as mensagens da DLQ com os atributos. */
   readDlq(): Promise<Message[]>;
+  /** Consome (lê e apaga) todas as mensagens disponíveis na fila de eventos. */
+  drainEvents(): Promise<Message[]>;
   delete(): Promise<void>;
 }
 
 export const MAX_RECEIVE_COUNT = 5;
 
-/** Cria uma fila FIFO descartável e sua DLQ (RedrivePolicy como a do ambiente) no LocalStack. */
+/** Cria filas FIFO descartáveis no LocalStack: transações + DLQ (RedrivePolicy como a do ambiente) e eventos. */
 export async function createTestQueues(): Promise<TestQueues> {
   const config = loadConfig(process.env);
   const sqs = new SQSClient({
@@ -38,6 +43,7 @@ export async function createTestQueues(): Promise<TestQueues> {
   const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
   const queueName = `wager-test-${suffix}.fifo`;
   const dlqName = `wager-test-${suffix}-dlq.fifo`;
+  const eventsQueueName = `wager-test-${suffix}-events.fifo`;
 
   const { QueueUrl: dlqUrl } = await sqs.send(
     new CreateQueueCommand({
@@ -58,12 +64,21 @@ export async function createTestQueues(): Promise<TestQueues> {
     }),
   );
 
+  const { QueueUrl: eventsUrl } = await sqs.send(
+    new CreateQueueCommand({
+      QueueName: eventsQueueName,
+      Attributes: { FifoQueue: 'true', ContentBasedDeduplication: 'false' },
+    }),
+  );
+
   return {
     sqs,
     queueName,
     dlqName,
     queueUrl: queueUrl!,
     dlqUrl: dlqUrl!,
+    eventsQueueName,
+    eventsUrl: eventsUrl!,
     async send(body, groupId) {
       await sqs.send(
         new SendMessageCommand({
@@ -95,10 +110,35 @@ export async function createTestQueues(): Promise<TestQueues> {
       );
       return Messages ?? [];
     },
+    async drainEvents() {
+      const drained: Message[] = [];
+      for (;;) {
+        const { Messages } = await sqs.send(
+          new ReceiveMessageCommand({
+            QueueUrl: eventsUrl,
+            MaxNumberOfMessages: 10,
+            WaitTimeSeconds: 1,
+            MessageAttributeNames: ['All'],
+            MessageSystemAttributeNames: ['MessageGroupId'],
+          }),
+        );
+        if (!Messages?.length) {
+          return drained;
+        }
+        drained.push(...Messages);
+        await sqs.send(
+          new DeleteMessageBatchCommand({
+            QueueUrl: eventsUrl,
+            Entries: Messages.map((message, index) => ({ Id: String(index), ReceiptHandle: message.ReceiptHandle! })),
+          }),
+        );
+      }
+    },
     async delete() {
       await Promise.allSettled([
         sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl })),
         sqs.send(new DeleteQueueCommand({ QueueUrl: dlqUrl })),
+        sqs.send(new DeleteQueueCommand({ QueueUrl: eventsUrl })),
       ]);
       sqs.destroy();
     },

@@ -27,6 +27,12 @@ export abstract class InboxRepository {
 export abstract class OutboxRepository {
   abstract findById(id: string): Promise<OutboxMessage | undefined>;
 
+  /**
+   * Trava e devolve até `limit` mensagens pendentes vencidas (`nextAttemptAt` vazio ou até `now`), na ordem em que foram
+   * gravadas. Mensagens travadas por outra transação são puladas. Precisa rodar dentro de uma transação.
+   */
+  abstract claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+
   abstract insert(message: OutboxMessage): Promise<void>;
 
   /** Grava tentativas, próxima tentativa e publicação. */
