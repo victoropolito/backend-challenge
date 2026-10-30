@@ -8,6 +8,8 @@
     "dev": "bun --watch src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:unit": "bun test test/unit",
+    "test:integration": "bun test test/integration",
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "infra:reset": "docker compose down -v && docker compose up -d --wait",
