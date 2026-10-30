@@ -1,4 +1,6 @@
 import { exponentialBackoffDelayMs, type BackoffPolicy } from '../../domain/shared/backoff';
+import { InboxMessage, type ReceiveInboxProps } from '../../domain/messaging/inbox-message';
+import type { InboxRepository } from '../../domain/messaging/messaging-repositories';
 import { DomainError } from '../../domain/shared/domain-error';
 import type { Money } from '../../domain/shared/money';
 import {
@@ -32,6 +34,8 @@ export interface SubmitWagerTransactionCommand {
   referenceExternalTransactionId: string | undefined;
   correlationId: string;
   causationId?: string | undefined;
+  /** Mensagem de fila que originou a submissão; é gravada como processada na inbox, na mesma transação SQL do desfecho. */
+  inbox?: ReceiveInboxProps | undefined;
 }
 
 export interface SubmitWagerTransactionResult {
@@ -45,6 +49,7 @@ export interface SubmitWagerTransactionDependencies {
   wallets: WalletRepository;
   wagerTransactions: WagerTransactionRepository;
   processor: WagerTransactionProcessor;
+  inbox: InboxRepository;
   clock: Clock;
   ids: IdGenerator;
   referenceCheckPolicy?: BackoffPolicy;
@@ -78,7 +83,7 @@ export class ExternalTransactionIdConflictError extends DomainError {
 
 /**
  * Recebe uma transação de provider: idempotente por (providerId, idempotencyKey), serializada por wallet com lock
- * pessimista, e atômica (transação, lançamento, saldo e eventos na mesma transação SQL).
+ * pessimista, e atômica (transação, lançamento, saldo, eventos e inbox na mesma transação SQL).
  */
 export class SubmitWagerTransactionUseCase {
   constructor(private readonly deps: SubmitWagerTransactionDependencies) {}
@@ -109,6 +114,7 @@ export class SubmitWagerTransactionUseCase {
 
     const replay = await this.findPrevious(transaction);
     if (replay !== undefined) {
+      await transactions.run(() => this.recordInbox(command, now));
       return replay;
     }
 
@@ -117,6 +123,7 @@ export class SubmitWagerTransactionUseCase {
         const wallet = await wallets.findByIdForUpdate(command.walletId);
         const concurrent = await this.findPrevious(transaction);
         if (concurrent !== undefined) {
+          await this.recordInbox(command, now);
           return concurrent;
         }
         await processor.process(transaction, wallet, {
@@ -125,12 +132,14 @@ export class SubmitWagerTransactionUseCase {
           causationId: command.causationId,
           onMissingReference: (pending) => pending.markPendingReference(this.nextReferenceCheck(pending, now)),
         });
+        await this.recordInbox(command, now);
         return { transaction, idempotentReplay: false };
       });
     } catch (error) {
       if (error instanceof DuplicateWagerTransactionError && error.conflict !== 'REVERSAL') {
         const raced = await this.findPrevious(transaction);
         if (raced !== undefined) {
+          await transactions.run(() => this.recordInbox(command, now));
           return raced;
         }
       }
@@ -153,6 +162,16 @@ export class SubmitWagerTransactionUseCase {
       throw new ExternalTransactionIdConflictError(transaction.providerId, transaction.externalTransactionId, sameExternalId.id);
     }
     return undefined;
+  }
+
+  /** Grava a mensagem de origem como processada; lança DuplicateInboxMessageError se ela já foi registrada. */
+  private async recordInbox(command: SubmitWagerTransactionCommand, now: Date): Promise<void> {
+    if (command.inbox === undefined) {
+      return;
+    }
+    const message = InboxMessage.receive(command.inbox);
+    message.markProcessed(now);
+    await this.deps.inbox.insert(message);
   }
 
   private nextReferenceCheck(transaction: WagerTransaction, now: Date): Date {

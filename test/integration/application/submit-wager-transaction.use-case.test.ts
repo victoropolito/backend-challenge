@@ -19,7 +19,10 @@ import {
 } from '../../../src/domain/wagering/wager-transaction';
 import type { Wallet } from '../../../src/domain/wallet/wallet';
 import { MikroOrmTransactionRunner } from '../../../src/infrastructure/database/mikro-orm-transaction-runner';
-import { MikroOrmOutboxRepository } from '../../../src/infrastructure/database/repositories/mikro-orm-messaging.repositories';
+import {
+  MikroOrmInboxRepository,
+  MikroOrmOutboxRepository,
+} from '../../../src/infrastructure/database/repositories/mikro-orm-messaging.repositories';
 import { MikroOrmWagerTransactionRepository } from '../../../src/infrastructure/database/repositories/mikro-orm-wager-transaction.repository';
 import {
   MikroOrmLedgerRepository,
@@ -49,7 +52,8 @@ beforeAll(async () => {
   const wagerTransactions = new MikroOrmWagerTransactionRepository(em);
   const outbox = new MikroOrmOutboxRepository(em);
   const processor = new WagerTransactionProcessor({ wallets, ledger, wagerTransactions, outbox, ids });
-  submitUseCase = new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, clock, ids });
+  const inbox = new MikroOrmInboxRepository(em);
+  submitUseCase = new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids });
   createWalletUseCase = new CreateWalletUseCase({ transactions, wallets, ledger, wagerTransactions, outbox, clock, ids });
 }, 30_000);
 

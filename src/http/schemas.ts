@@ -1,39 +1,13 @@
 import { z } from 'zod';
-import { isUuid } from '../application/shared/uuid';
 import { MAX_LEDGER_PAGE_SIZE } from '../application/wallet/wallet-queries';
-import { WagerTransactionKind } from '../domain/wagering/wager-transaction';
-
-const identifier = z.string().trim().min(1).max(255);
-
-const uuid = z.string().trim().refine(isUuid, 'must be a UUID');
-
-const money = z.object({
-  amount: z.string(),
-  currency: z.string(),
-});
+import { identifier, moneyInput, uuid, WagerTransactionInput } from '../contracts/wager-transaction-input';
 
 export const CreateWalletBody = z.object({
   playerId: identifier,
-  initialBalance: money,
+  initialBalance: moneyInput,
 });
 
-export const SubmitWagerTransactionBody = z.object({
-  providerId: identifier,
-  externalTransactionId: identifier,
-  playerId: identifier,
-  walletId: uuid,
-  roundId: identifier,
-  gameId: identifier,
-  kind: z.enum([
-    WagerTransactionKind.Bet,
-    WagerTransactionKind.Win,
-    WagerTransactionKind.Loss,
-    WagerTransactionKind.Refund,
-    WagerTransactionKind.Rollback,
-  ]),
-  money,
-  referenceExternalTransactionId: identifier.nullish(),
-});
+export const SubmitWagerTransactionBody = WagerTransactionInput;
 
 export const IdempotencyKeyHeader = identifier;
 

@@ -17,7 +17,9 @@ src/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
 │   ├── messaging/          cliente SQS
 │   └── system/             relógio do sistema e gerador de UUIDv7
+├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
 ├── http/                   controllers, validação (Zod), correlation id, filtro de erros
+├── consumer/               leitura das mensagens da fila e classificação de falhas
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
@@ -119,7 +121,7 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
   1. Valida o payload (`walletId` UUID; regras de `WagerTransaction.create`) e calcula o `payloadHash`. Payload inválido lança erro e nada é gravado.
   2. **Caminho rápido de idempotência**, sem transação: procura por `(providerId, idempotencyKey)`. Achou com o mesmo hash → replay (`idempotentReplay = true`, transação gravada com o saldo observado original). Achou com outro hash → `IdempotencyConflictError`. Se a chave é nova mas o `externalTransactionId` já existe (sob outra chave) → `ExternalTransactionIdConflictError`.
   3. Abre a transação SQL e trava a wallet (`SELECT ... FOR UPDATE`). **Repete a verificação de idempotência já com o lock**: uma submissão idêntica concorrente na mesma wallet terá sido confirmada antes, e esta vira replay.
-  4. `WagerTransactionProcessor` decide e grava tudo na mesma transação: transação, lançamento, saldo (`update` com verificação de versão) e eventos na outbox.
+  4. `WagerTransactionProcessor` decide e grava tudo na mesma transação: transação, lançamento, saldo (`update` com verificação de versão) e eventos na outbox. Quando a submissão vem da fila, a mensagem de origem é gravada na inbox nessa mesma transação (seção 8.2).
   5. Se mesmo assim o insert colidir na unicidade (concorrência sem lock comum, por exemplo com uma wallet inexistente), a transação é desfeita e a submissão anterior é relida: vira replay ou conflito, nunca duplicação.
 - **Ordem das regras no processor:** wallet inexistente (`WALLET_NOT_FOUND`) → wallet de outro jogador (`WALLET_PLAYER_MISMATCH`) → moeda (`CURRENCY_MISMATCH`) → referência (ausente ⇒ `PENDING_REFERENCE`; senão `checkReference`) → reversão única (`REFERENCE_ALREADY_REVERSED`) → saldo (`INSUFFICIENT_BALANCE` para `BET`, `REVERSAL_INSUFFICIENT_BALANCE` para `ROLLBACK` que debitaria) → aplica. Toda rejeição é gravada (auditável e idempotente) e gera `WagerTransactionRejected`.
 - O processor é separado do caso de uso para ser reutilizado pelo worker de `PENDING_REFERENCE`: ele aceita uma transação nova (`PENDING`, inserida) ou já gravada (`PENDING_REFERENCE`, atualizada), e quem chama decide o que fazer quando a referência continua ausente (`onMissingReference`). Na submissão, a primeira verificação fica agendada para `agora + 1 s` (backoff exponencial até 60 s; o limite de tentativas entra com o worker).
@@ -216,7 +218,7 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 
 ### 7.3 Validação
 
-- Toda entrada (body, params, query, headers) passa por um schema **Zod** antes de chegar ao caso de uso. Todos os ids (provider, external id, player, rodada, jogo, referência, `Idempotency-Key`, `walletId`, `transactionId`) passam por `trim` antes de qualquer outra regra: o valor aparado é o que entra no hash, é gravado e é usado nas consultas, então `" abc "` e `"abc"` são o mesmo id (e o reenvio de um vira replay do outro). Depois do `trim`, ids de texto têm de 1 a 255 caracteres; `walletId` e `transactionId` precisam ser UUID. `kind` aceita só `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK` (`OPENING` é interno). `amount` precisa ser string: número JSON é recusado, porque já chegaria arredondado por ponto flutuante.
+- Toda entrada (body, params, query, headers) passa por um schema **Zod** antes de chegar ao caso de uso. Os schemas dos campos da transação ficam em `src/contracts` e são os mesmos do consumidor SQS. Todos os ids (provider, external id, player, rodada, jogo, referência, `Idempotency-Key`, `walletId`, `transactionId`) passam por `trim` antes de qualquer outra regra: o valor aparado é o que entra no hash, é gravado e é usado nas consultas, então `" abc "` e `"abc"` são o mesmo id (e o reenvio de um vira replay do outro). Depois do `trim`, ids de texto têm de 1 a 255 caracteres; `walletId` e `transactionId` precisam ser UUID. `kind` aceita só `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK` (`OPENING` é interno). `amount` precisa ser string: número JSON é recusado, porque já chegaria arredondado por ponto flutuante.
 - Campos desconhecidos no body são ignorados: não entram no hash nem são persistidos.
 - `Idempotency-Key` é obrigatório (1 a 255 caracteres). O formato recomendado `{providerId}:{externalTransactionId}` não é imposto.
 
@@ -228,7 +230,40 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 
 `GET /wallets/:walletId/ledger?cursor=&limit=` devolve `{ items, nextCursor }` em ordem de gravação (`sequence`), `limit` padrão 50 e máximo 200. O cursor é opaco (base64url de `{ wallet, posição }`) e **estável**: o ledger é append-only, então páginas já lidas nunca mudam e lançamentos novos aparecem no fim. Um cursor de outra wallet ou adulterado é recusado (`INVALID_CURSOR`). `nextCursor = null` indica a última página.
 
-## 8. Interpretações adotadas
+## 8. Consumidor SQS
+
+### 8.1 Mensagem
+
+- O corpo é o `WagerTransactionRequested` do enunciado, validado com os **mesmos schemas da API** (mesmos limites, `trim`, UUID, `kind` sem `OPENING`, `amount` como string) e mais: `messageId` (1 a 255 caracteres), `type` fixo, `occurredAt` em ISO-8601 e `data.idempotencyKey` obrigatório.
+- A chave da inbox é o **`messageId` do corpo**, e não o `MessageId` do SQS: o do SQS muda a cada envio, enquanto o do corpo continua o mesmo quando o produtor reenvia a mesma mensagem lógica.
+- O `messageId` vira o `correlationId` e o `causationId` dos eventos gerados.
+- O hash da inbox é o SHA-256 do JSON canônico do **corpo inteiro como recebido** (antes do `trim`). Ele serve só para detectar o mesmo `messageId` com outro conteúdo; a idempotência da transação continua sendo a da seção 6.
+
+### 8.2 Inbox e atomicidade
+
+- `ConsumeWagerTransactionMessageUseCase` consulta a inbox por `(consumerName, messageId)`. Já processada com o mesmo hash → **duplicata** (confirmar sem efeito). Com outro hash → `InboxPayloadConflictError` (`INBOX_PAYLOAD_CONFLICT`).
+- Se a mensagem é nova, chama **o mesmo `SubmitWagerTransactionUseCase` da API**, passando a mensagem de origem. A submissão grava a inbox como processada **na mesma transação SQL** do desfecho: transação, lançamento, saldo, outbox e inbox são confirmados juntos ou desfeitos juntos.
+- `REJECTED` e `PENDING_REFERENCE` também são desfechos: a inbox é gravada e a mensagem pode ser confirmada.
+- Outra mensagem para uma transação já aplicada (reenvio com outro `messageId`) vira replay e também é gravada na inbox, numa transação curta, já que nada financeiro muda.
+- Entregas concorrentes da mesma mensagem: a segunda espera o lock da wallet, enxerga a transação como replay e colide na chave primária da inbox. O caso de uso relê a inbox e devolve duplicata.
+- A inbox só contém mensagens processadas, porque o registro nasce no commit do desfecho. Um processamento que falha não deixa rastro (rollback), e a próxima entrega recomeça do zero.
+
+### 8.3 Classificação de falhas
+
+| Desfecho | Exemplos | Ação |
+|---|---|---|
+| Processada | `PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, replay, duplicata | confirmar (`DeleteMessage`) **depois do commit** |
+| Falha permanente | `MALFORMED_MESSAGE`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`, `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `INBOX_PAYLOAD_CONFLICT` | DLQ imediatamente: repetir não muda o resultado, e a DLQ preserva a mensagem para análise (pela API seriam 400/409) |
+| Falha transitória | erros transitórios do banco (conexão, deadlock, lock timeout), `WALLET_CONCURRENT_MODIFICATION`, `DUPLICATE_INBOX_MESSAGE` sem registro visível | nova tentativa com backoff; esgotado o limite, DLQ |
+| Falha inesperada (bug) | qualquer outro erro | tratada como transitória até o limite (pode ser passageira), registrada como erro |
+
+**`FAILED`/`PROCESSING_ERROR` não é produzido pelo consumidor.** Uma falha que esgota as tentativas não tem estado confirmado para anotar, porque a transação SQL foi desfeita por inteiro. Gravar `FAILED` ainda exigiria o banco, que pode ser justamente o que está fora. O registro da falha é a mensagem na DLQ, e reprocessá-la (redrive) é seguro pela idempotência. O status continua no modelo, reservado para falhas permanentes de transações já gravadas (worker de `PENDING_REFERENCE`).
+
+### 8.4 Loop de consumo (**planejado**)
+
+Long polling na fila FIFO; mensagens do mesmo `MessageGroupId` processadas em ordem e grupos diferentes em paralelo; `DeleteMessage` só depois do commit; nova tentativa via `ChangeMessageVisibility` com backoff calculado pelo `ApproximateReceiveCount`; envio explícito à DLQ (falha permanente ou limite esgotado), com o motivo em atributos da mensagem; `RedrivePolicy` com `maxReceiveCount = 5` como rede de segurança; shutdown gracioso (para de receber, conclui as mensagens em andamento e devolve a visibilidade das que não começaram).
+
+## 9. Interpretações adotadas
 
 | Tema | Interpretação | Motivo |
 |---|---|---|
@@ -243,22 +278,22 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 | Mesmo `externalTransactionId` com outra idempotency key | Conflito, não replay | O header é a fonte da verdade da idempotência |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
 
-## 9. Limitações conhecidas
+## 10. Limitações conhecidas
 
 - Depois de `BET` → `REFUND` → `ROLLBACK` do `REFUND`, a `BET` não pode ser revertida de novo (o índice de reversão única continua vendo o `REFUND` processado). É um caso raro e o comportamento é conservador.
 - `WalletBalanceChanged.from` identifica o lançamento mais recente comparando o saldo final com o saldo atual; um lançamento antigo com o mesmo saldo final passaria. O risco é baixo, porque o evento é criado logo após o movimento.
 - A imutabilidade do ledger é garantida por trigger, que vale para qualquer role. Restringir permissões por role no banco (aplicação sem `UPDATE`/`DELETE`) ficou de fora, porque o ambiente local usa um único usuário.
 - Ledger de partidas simples (sem conta de contrapartida da casa).
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
-- O status `FAILED`/`PROCESSING_ERROR` ainda não é produzido: erros de infraestrutura na submissão desfazem a transação SQL e sobem como erro transitório (o cliente pode repetir com segurança). O uso de `FAILED` será definido junto com o consumer SQS (falha permanente depois da DLQ).
+- O status `FAILED`/`PROCESSING_ERROR` ainda não é produzido: erros de infraestrutura desfazem a transação SQL inteira e são repetidos (HTTP 503 ou nova entrega da fila). Ver a seção 8.3.
 
-## 10. Testes
+## 11. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
-- **Unitários da API:** mapeamento de exceções para status e classificação de erros transitórios do banco.
-- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP.
+- **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
+- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP. O consumo de mensagens é testado no banco real: inbox gravada com o desfecho, redelivery como duplicata, mesmo `messageId` com outro conteúdo, reenvio com outro `messageId` como replay, rejeição e `PENDING_REFERENCE` registrados, conflito sem inbox, rollback da inbox junto com transação, ledger e eventos (falha injetada na outbox), a mesma mensagem 20 vezes em paralelo e 50 mensagens diferentes para a mesma transação em paralelo (um único débito).
 - Nenhum mock de banco. **Planejado:** LocalStack nos testes de mensageria, testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
-## 11. Pendências
+## 12. Pendências
 
-Consumer SQS (inbox, retry, DLQ, shutdown gracioso); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Loop do consumidor SQS (ack, retry, DLQ, shutdown gracioso; seção 8.4); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

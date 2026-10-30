@@ -1,5 +1,5 @@
 import { Module, type Provider } from '@nestjs/common';
-import { OutboxRepository } from '../domain/messaging/messaging-repositories';
+import { InboxRepository, OutboxRepository } from '../domain/messaging/messaging-repositories';
 import { WagerTransactionRepository } from '../domain/wagering/wager-transaction-repository';
 import { LedgerRepository, WalletRepository } from '../domain/wallet/wallet-repository';
 import { SystemClock } from '../infrastructure/system/system-clock';
@@ -7,11 +7,15 @@ import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
 import { Clock } from './shared/clock';
 import { IdGenerator } from './shared/id-generator';
 import { TransactionRunner } from './shared/transaction-runner';
+import { ConsumeWagerTransactionMessageUseCase } from './wagering/consume-wager-transaction-message.use-case';
 import { SubmitWagerTransactionUseCase } from './wagering/submit-wager-transaction.use-case';
 import { WagerTransactionQueries } from './wagering/wager-transaction-queries';
 import { WagerTransactionProcessor } from './wagering/wager-transaction-processor';
 import { CreateWalletUseCase } from './wallet/create-wallet.use-case';
 import { WalletQueries } from './wallet/wallet-queries';
+
+/** Nome do consumidor da fila de transações na inbox. */
+export const WAGER_TRANSACTIONS_CONSUMER = 'wager-transactions-consumer';
 
 const USE_CASES: Provider[] = [
   {
@@ -29,15 +33,30 @@ const USE_CASES: Provider[] = [
   },
   {
     provide: SubmitWagerTransactionUseCase,
-    inject: [TransactionRunner, WalletRepository, WagerTransactionRepository, WagerTransactionProcessor, Clock, IdGenerator],
+    inject: [
+      TransactionRunner,
+      WalletRepository,
+      WagerTransactionRepository,
+      WagerTransactionProcessor,
+      InboxRepository,
+      Clock,
+      IdGenerator,
+    ],
     useFactory: (
       transactions: TransactionRunner,
       wallets: WalletRepository,
       wagerTransactions: WagerTransactionRepository,
       processor: WagerTransactionProcessor,
+      inbox: InboxRepository,
       clock: Clock,
       ids: IdGenerator,
-    ) => new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, clock, ids }),
+    ) => new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids }),
+  },
+  {
+    provide: ConsumeWagerTransactionMessageUseCase,
+    inject: [InboxRepository, SubmitWagerTransactionUseCase],
+    useFactory: (inbox: InboxRepository, submit: SubmitWagerTransactionUseCase) =>
+      new ConsumeWagerTransactionMessageUseCase({ consumerName: WAGER_TRANSACTIONS_CONSUMER, inbox, submit }),
   },
 ];
 
