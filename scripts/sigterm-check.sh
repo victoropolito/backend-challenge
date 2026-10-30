@@ -17,7 +17,7 @@ RUN="sigterm-$(date +%s)"
 
 psql() { docker compose exec -T postgres psql -U wagering -d wagering -tAc "$1"; }
 awslocal() { docker compose exec -T localstack awslocal "$@"; }
-consumer_logs() { docker logs "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "WagerTransactionConsumer|ERROR" | tail -"$1"; }
+consumer_logs() { docker logs "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E '"context":"WagerTransactionConsumer"|"level":"error"' | tail -"$1"; }
 cleanup() { docker rm -f -v "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 

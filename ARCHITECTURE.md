@@ -1,6 +1,6 @@
 # Arquitetura — Distributed Wagering Processor
 
-Este documento registra as decisões técnicas, os trade-offs e as limitações conhecidas da solução. Como subir o ambiente, rodar e validar manualmente (inclusive o shutdown com `SIGTERM` real) está em [`docs/execucao-e-validacao.md`](docs/execucao-e-validacao.md). Ele é atualizado a cada etapa; seções marcadas como **planejado** descrevem o desenho adotado para partes ainda não implementadas.
+Este documento registra as decisões técnicas, os trade-offs e as limitações conhecidas da solução. Como subir o ambiente, rodar e validar manualmente (inclusive o shutdown com `SIGTERM` real) está em [`docs/execucao-e-validacao.md`](docs/execucao-e-validacao.md). A visão geral, o setup e os comandos estão no [`README.md`](README.md); o enunciado, em [`docs/enunciado.md`](docs/enunciado.md).
 
 ## 1. Visão geral
 
@@ -19,7 +19,7 @@ src/
 │   ├── observability/      logs JSON (StructuredLogger, contexto, adaptador do NestJS), métricas Prometheus e monitores de transações e reconciliação
 │   └── system/             relógio do sistema e gerador de UUIDv7
 ├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
-├── http/                   controllers, validação (Zod), correlation id, filtro de erros
+├── http/                   controllers, validação (Zod), correlation id, filtro de erros, autenticação (ponto de extensão)
 ├── consumer/               consumidor SQS: leitura das mensagens, classificação de falhas, loop, DLQ, shutdown
 ├── workers/                processos em segundo plano: publisher da outbox e worker de PENDING_REFERENCE
 ├── health/                 /health/live e /health/ready
@@ -117,6 +117,7 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
 
 - Os casos de uso são classes simples (sem decorators), que recebem as portas no construtor e são registradas no NestJS por factory (`ApplicationModule`).
 - **Portas da aplicação:** `Clock` (instante atual), `IdGenerator` (ids internos, **UUIDv7**: ordenados pelo instante de criação, o que mantém os índices B-tree compactos) e `TransactionRunner` (executa um bloco numa transação SQL; a implementação usa `em.transactional()`, e os repositórios chamados dentro do bloco participam da mesma transação via `AsyncLocalStorage`). Os testes usam relógio fixo.
+- **Monitores:** `WageringMonitor` e `ReconciliationMonitor` são portas que recebem os desfechos **depois do commit** (transação gravada, replay, conflito, reconciliação). As implementações registram log e métricas (seção 12).
 - **Criação de wallet (`CreateWalletUseCase`):** numa única transação SQL grava a wallet e, se o saldo inicial for positivo, a transação `OPENING` (`PROCESSED`), o lançamento `CREDIT` de abertura e dois eventos na outbox: `WagerTransactionProcessed` (da `OPENING`) e `WalletBalanceChanged`. Com saldo zero, grava só a wallet. Se qualquer escrita falhar, nada fica gravado. Wallet duplicada para o mesmo `playerId` + moeda lança `WalletAlreadyExistsError` (conflito), inclusive sob criação concorrente: a unicidade é do banco, e o insert concorrente espera o commit do primeiro e então falha.
 
 - **Submissão de transação (`SubmitWagerTransactionUseCase`):**
@@ -176,13 +177,13 @@ A unidade de concorrência é a wallet.
 - **Verificação de versão como defesa extra:** `update(wallet, expectedVersion)` grava com `WHERE id = ? AND version = ?`. Se nenhuma linha for afetada, lança `WalletConcurrentModificationError` e a transação inteira é desfeita.
 - **Por que pessimista e não otimista puro:** numa *hot wallet* (muitas apostas simultâneas no mesmo jogador), o lock otimista gera tempestades de retry e latência imprevisível. O lock pessimista enfileira as operações e cada uma executa uma vez. O custo é manter a transação curta: dentro dela não há chamada de rede (a publicação de eventos sai pela outbox, depois do commit).
 - Testado: duas transações disputando a mesma wallet; a segunda fica comprovadamente bloqueada (`pg_stat_activity`, `wait_event_type = 'Lock'`) e, ao entrar, enxerga o saldo já atualizado.
-- **Implementado no caso de uso de submissão:** o lock é adquirido antes de qualquer decisão (idempotência, referência, reversão única, saldo), então a decisão sempre vê o estado mais recente da wallet (`READ COMMITTED`: cada comando lê o que já foi confirmado). A referência de uma reversão precisa ser da mesma wallet, então a regra "reverter uma vez" também fica serializada pelo mesmo lock. O índice único de reversão continua como garantia final.
+- **No caso de uso de submissão:** o lock é adquirido antes de qualquer decisão (idempotência, referência, reversão única, saldo), então a decisão sempre vê o estado mais recente da wallet (`READ COMMITTED`: cada comando lê o que já foi confirmado). A referência de uma reversão precisa ser da mesma wallet, então a regra "reverter uma vez" também fica serializada pelo mesmo lock. O índice único de reversão continua como garantia final.
 - **Testado com paralelismo real** (conexões concorrentes ao PostgreSQL): o cenário obrigatório (100,00 e duas apostas de 80,00) repetido em 10 wallets ao mesmo tempo; 50 submissões idênticas (1 aplicada, 49 replays, 1 lançamento); 50 apostas numa *hot wallet* (nunca fica negativa; 20 aplicadas, 30 rejeitadas); `REFUND` e `ROLLBACK` simultâneos da mesma aposta (só uma reversão); wallets diferentes em paralelo; e **ausência de lock global**: com a wallet A travada por outra transação, uma aposta na wallet B termina enquanto a de A continua esperando (com um lock global de propósito, o teste falha por timeout). Retirando o lock (`findById` no lugar de `findByIdForUpdate`), esses testes falham, o que confirma que eles detectam a corrida.
 - **Testado com várias instâncias reais:** 3 processos da aplicação sobre o mesmo banco e as mesmas filas, com as apostas concorrentes de cada wallet enviadas a instâncias diferentes, e uma instância morta (`SIGKILL`) no meio de uma rajada de mensagens. Ver a seção 15.
 
 ## 6. Idempotência
 
-- **Implementado:** unicidade persistente por `(provider_id, external_transaction_id)` e `(provider_id, idempotency_key)`; `payload_hash` SHA-256 hex obrigatório no schema; `WagerTransaction.matchesPayload(hash)`; conflitos de inserção concorrente traduzidos para `DuplicateWagerTransactionError`.
+- **Unicidade persistente** por `(provider_id, external_transaction_id)` e `(provider_id, idempotency_key)`; `payload_hash` SHA-256 hex obrigatório no schema; `WagerTransaction.matchesPayload(hash)`; conflitos de inserção concorrente traduzidos para `DuplicateWagerTransactionError`.
 - **Algoritmo do hash (implementado em `application/shared/payload-hash.ts`):** `payloadHash = hex(SHA-256(UTF-8(canonicalJson(campos))))`, em hexadecimal minúsculo. O JSON canônico segue as regras do RFC 8785 (JCS) para o subconjunto usado: sem espaços; chaves de objeto ordenadas recursivamente por code unit UTF-16; ordem dos arrays preservada; strings e números serializados como no `JSON.stringify`. Valores que não são JSON puro (`undefined`, `NaN`, `Infinity`, `Date`, `bigint`, instâncias de classe) são **recusados**, nunca descartados em silêncio: um campo ausente precisa ser `null` explícito, para que "ausente" e "nulo" não gerem hashes diferentes por acaso. Strings não passam por normalização Unicode.
 - **Hash da `OPENING`:** `{ kind: "OPENING", walletId, playerId, money: { amount, currency } }`.
 - **Hash da submissão:** `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money: { amount, currency }, referenceExternalTransactionId }`, com a referência ausente como `null` e o valor já normalizado pelo `Money` (`"25"` e `"25.00"` são o mesmo pedido). O header `Idempotency-Key`, `correlationId` e metadados de transporte não entram.
@@ -535,4 +536,4 @@ Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), �
 
 ## 16. Pendências
 
-README de setup.
+Nenhum item obrigatório do enunciado em aberto. Fora do escopo entregue, e documentado nas seções acima: provedor de identidade real (seção 7.6), limpeza da outbox publicada, reconciliação periódica de todas as wallets e teste de carga (`bun run test:load`, diferencial opcional).

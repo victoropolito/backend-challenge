@@ -191,7 +191,7 @@ docker compose exec -T localstack awslocal sqs receive-message --queue-url $DLQ 
   --max-number-of-messages 10 --visibility-timeout 0 --message-attribute-names All
 ```
 
-O log da aplicação mostra `Message ... sent to the DLQ (PERMANENT): MALFORMED_MESSAGE: ...`.
+O log da aplicação mostra uma linha `{"level":"warn","context":"WagerTransactionConsumer","message":"Message sent to the DLQ","failureKind":"PERMANENT","failureCode":"MALFORMED_MESSAGE",...}`.
 
 ### Eventos publicados
 
@@ -230,12 +230,13 @@ Parâmetros por variável de ambiente: `WALLETS` (5), `PER_WALLET` (100), `STOP_
 Saída esperada (os números variam a cada execução):
 
 ```
-== docker stop (SIGTERM) com 65/500 processadas
-   o container parou em 882 ms com exit code 143
-   ... LOG [WagerTransactionConsumer] Stopping: 1 message(s) in progress
-   ... LOG [WagerTransactionConsumer] Stopped: messages in progress were finished
+== docker stop (SIGTERM) com 51/500 processadas
+   o container parou em 1018 ms com exit code 143
+   {"time":"...","level":"info","context":"WagerTransactionConsumer","message":"Consuming",...}
+   {"time":"...","level":"info","context":"WagerTransactionConsumer","message":"Stopping","inFlight":1}
+   {"time":"...","level":"info","context":"WagerTransactionConsumer","message":"Stopped: messages in progress were finished"}
 == estado logo depois do SIGTERM
-   transações=74 ledger=74 inbox=74 wallets_com_saldo_errado=0
+   transações=62 ledger=62 inbox=62 wallets_com_saldo_errado=0
 == estado depois do restart
    transações=500 ledger=500 inbox=500 wallets_com_saldo_errado=0
    fila principal (visíveis, em processamento): 0 0
@@ -246,7 +247,7 @@ Como ler:
 
 - **Exit code 143** = o processo terminou pelo `SIGTERM` depois dos hooks de shutdown. **137** = foi morto pelo `SIGKILL` do `docker stop` depois de 30 s, ou seja, o shutdown travou.
 - O tempo de parada fica abaixo de 1 s com mensagens curtas. O limite é o long polling em curso (`SQS_CONSUMER_WAIT_TIME_SECONDS`, 2 s no script) mais o `SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS`.
-- `Stopping: N message(s) in progress` mostra quantas estavam sendo processadas no momento do sinal; `Stopped: ...` confirma que foram concluídas. Se aparecer `Shutdown timeout reached; releasing ...`, elas foram devolvidas à fila e serão reprocessadas com segurança.
+- `Stopping` traz em `inFlight` quantas mensagens estavam sendo processadas no momento do sinal; `Stopped: messages in progress were finished` confirma que foram concluídas. Se aparecer `Shutdown timeout reached; releasing in-flight messages` (com `released`), elas foram devolvidas à fila e serão reprocessadas com segurança. Linhas com `"level":"error"` também aparecem aqui.
 - A diferença entre "processadas" no momento do `docker stop` e "logo depois do SIGTERM" são as mensagens concluídas durante o shutdown.
 - O script sai com código 1 e `FALHOU` se alguma verificação falhar.
 
