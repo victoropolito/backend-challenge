@@ -203,6 +203,8 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 | Referência ausente, processamento adiado (`PENDING_REFERENCE`) | 202 | — | não precisa; acompanhar pelo GET ou pelos eventos |
 | Payload inválido (formato, tipo, campo ausente, valor com mais de 2 casas, regra de formato do domínio) | 400 | `VALIDATION_ERROR`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`, `INVALID_WALLET_OPERATION`, `INVALID_CURSOR`, `MALFORMED_REQUEST` | só depois de corrigir |
 | Recurso inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `NOT_FOUND` | — |
+| Credencial ausente ou inválida (seção 7.6) | 401 + `WWW-Authenticate` | `UNAUTHENTICATED` | só com credencial válida |
+| Credencial de outro provider (seção 7.6) | 403 | `PROVIDER_FORBIDDEN` | não |
 | Conflito: wallet duplicada, idempotency key com outro payload, `externalTransactionId` sob outra chave | 409 | `WALLET_ALREADY_EXISTS`, `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT` | não com a mesma chave |
 | Rejeição por regra de negócio (transação gravada como `REJECTED`), ou transação que terminou `FAILED` | 422 | corpo traz o `failureCode` | não; ver ação na seção 3.4 |
 | Falha transitória de infraestrutura (conexão, deadlock, lock timeout) | 503 + `Retry-After` | `SERVICE_UNAVAILABLE`, `WALLET_CONCURRENT_MODIFICATION` | **sim**, com a mesma chave |
@@ -233,6 +235,34 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 ### 7.5 Paginação do ledger
 
 `GET /wallets/:walletId/ledger?cursor=&limit=` devolve `{ items, nextCursor }` em ordem de gravação (`sequence`), `limit` padrão 50 e máximo 200. O cursor é opaco (base64url de `{ wallet, posição }`) e **estável**: o ledger é append-only, então páginas já lidas nunca mudam e lançamentos novos aparecem no fim. Um cursor de outra wallet ou adulterado é recusado (`INVALID_CURSOR`). `nextCursor = null` indica a última página.
+
+### 7.6 Autenticação
+
+**Decisão: não integrar um provedor de identidade neste desafio.** Autenticação não vale pontos, e o enunciado aceita deixá-la documentada com um ponto de extensão no código. O tempo foi para correção financeira, concorrência e idempotência.
+
+**O que existe no código (`src/http/auth/`):**
+
+- **Porta `RequestAuthenticator`:** recebe os headers e devolve o `Principal` (`subject` e `providerId`), ou `undefined` quando a credencial está ausente ou é inválida.
+- **Implementação ligada hoje, `AllowAllAuthenticator`:** aceita toda requisição como o principal anônimo, sem restrição de provider. No boot, a aplicação registra o aviso `Authentication disabled: every API request is accepted as anonymous`.
+- **`AuthenticationGuard`:** protege `WalletsController` e `WageringController`. Sem principal, responde **401** `UNAUTHENTICATED`, com `WWW-Authenticate: Bearer`. O principal fica guardado na requisição.
+- **Restrição por provider, já aplicada nos controllers** (com o principal anônimo, nunca recusa):
+  - submeter para outro provider → **403** `PROVIDER_FORBIDDEN`, antes de chegar ao caso de uso;
+  - consultar pelo `providerId` de outro provider → **403**;
+  - consultar pelo id interno uma transação de outro provider → **404**, para não revelar que ela existe.
+- **Fora da autenticação, como define o enunciado:**
+  - `/health/*` e `/metrics` ficam abertos;
+  - a fila é um canal interno confiável. O `providerId` da mensagem continua passando pelas mesmas validações de domínio e de idempotência.
+
+**Desenho adotado se o provedor de identidade for integrado** (Keycloak ou Zitadel no `docker-compose`):
+
+1. Cada provider é um *client* OIDC confidencial, com fluxo *client credentials* (máquina a máquina, sem usuário). O token leva o id do provider num claim próprio, por exemplo `provider_id`, configurado como *mapper* no client.
+2. Uma implementação `JwtRequestAuthenticator` lê `Authorization: Bearer <jwt>` e valida o token localmente:
+   - assinatura pelas chaves do JWKS do provedor, guardadas em cache e renovadas quando aparece um `kid` desconhecido;
+   - `iss`, `aud` e `exp`, com tolerância pequena de relógio.
+
+   O `provider_id` vira `Principal.providerId`. Não há chamada ao provedor por requisição (sem *introspection*), e o token nunca vai para o log.
+3. Para ligar, basta trocar o provider de `RequestAuthenticator` no `ApiModule` e configurar `OIDC_ISSUER_URL` e `OIDC_AUDIENCE`. Controllers e casos de uso não mudam: a restrição por provider já está no lugar.
+4. Os endpoints de wallet (criar, consultar, ledger, reconciliar) não são de provider; são da plataforma ou do backoffice. Eles exigiriam um papel próprio no token, por exemplo `wallet-admin`, verificado por um guard de papel. Esse papel ainda não está modelado no `Principal`.
 
 ## 8. Consumidor SQS
 
@@ -457,6 +487,7 @@ Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), �
 - Ledger de partidas simples (sem conta de contrapartida da casa).
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
 - Os logs vão só para o stdout; a coleta e a retenção ficam com a plataforma (Docker, agente de logs). As mensagens de erro inesperado (`error.message`) entram no log como vieram, e mensagens de bibliotecas podem trazer detalhes do pedido.
+- Autenticação desligada (`AllowAllAuthenticator`): qualquer cliente que alcance a API age por qualquer provider. O desenho com provedor de identidade está na seção 7.6; até lá, a API deve ficar atrás de uma rede privada ou de um gateway que autentique.
 - As métricas ficam em memória, por instância, e zeram no restart; não há push nem armazenamento próprio (o Prometheus coleta e guarda). `/metrics` não tem autenticação: em produção deve ficar acessível só pela rede interna, como os health checks.
 - O histograma de lock mede o `SELECT ... FOR UPDATE` inteiro (espera pelo lock mais a leitura, que leva poucos milissegundos); não separa as duas partes.
 - A reconciliação é sob demanda, uma wallet por chamada. Não há rotina periódica que percorra todas as wallets, nem histórico das reconciliações (o resultado só vai para a resposta e para o log).
@@ -468,7 +499,7 @@ Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), �
 ## 15. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
-- **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
+- **Unitários da API e do consumidor:** autenticação (guard com 401 e `WWW-Authenticate`, principal na requisição, submissão para outro provider recusada antes do caso de uso, consulta de transação de outro provider como 404/403, principal anônimo sem restrição), mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
 - **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP. O consumo de mensagens é testado no banco real: inbox gravada com o desfecho, redelivery como duplicata, mesmo `messageId` com outro conteúdo, reenvio com outro `messageId` como replay, rejeição e `PENDING_REFERENCE` registrados, conflito sem inbox, rollback da inbox junto com transação, ledger e eventos (falha injetada na outbox), a mesma mensagem 20 vezes em paralelo e 50 mensagens diferentes para a mesma transação em paralelo (um único débito).
 - **Consumidor SQS no LocalStack real** (filas FIFO e DLQ descartáveis por teste, com a mesma `RedrivePolicy`): aplicação e confirmação após o commit, rejeição de negócio confirmada sem retry, redelivery e reenvio aplicados uma vez, mensagem já commitada antes de um "crash" confirmada sem reaplicar, mensagem malformada e conflito de idempotência direto para a DLQ com os atributos de falha, falha transitória repetida com backoff até dar certo, tentativas esgotadas indo para a DLQ, ordem dentro do grupo com grupos em paralelo, shutdown que espera a mensagem em andamento e para de receber, e timeout de shutdown que devolve a visibilidade (outra instância processa logo, sem esperar os 30 s). Mais um teste sobe a aplicação Nest real com o consumidor ligado pela config e o para no `close()`. Mutações conferidas: sem devolver a visibilidade e sem ordem por grupo, os testes falham.
 - **Shutdown com `SIGTERM` real** (`scripts/sigterm-check.sh`, manual): a aplicação num container Linux recebe `docker stop` no meio de uma rajada de mensagens; o script confere transações = ledger = inbox e saldos corretos logo depois do sinal e, após o restart, que tudo foi aplicado exatamente uma vez. Ver `docs/execucao-e-validacao.md` §7.
@@ -482,4 +513,4 @@ Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), �
 
 ## 16. Pendências
 
-Autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Testes de concorrência e de falha (≥ 3 instâncias, reinício com consistência final); README de setup.

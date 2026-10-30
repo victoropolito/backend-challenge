@@ -7,6 +7,7 @@ import { DomainError } from '../../../src/domain/shared/domain-error';
 import { InvalidMoneyError } from '../../../src/domain/shared/money';
 import { InvalidTransactionStateError } from '../../../src/domain/wagering/wager-transaction';
 import { WalletConcurrentModificationError } from '../../../src/domain/wallet/wallet-repository';
+import { ProviderForbiddenError, UnauthenticatedError } from '../../../src/http/auth/request-authenticator';
 import { toErrorResponse } from '../../../src/http/http-error.filter';
 import { RequestValidationError } from '../../../src/http/request-validation';
 import { isTransientDatabaseError } from '../../../src/infrastructure/database/transient-error';
@@ -29,6 +30,8 @@ describe('toErrorResponse', () => {
     ['invalid money', new InvalidMoneyError('bad'), 400],
     ['not found', new WalletNotFoundError('w-1'), 404],
     ['idempotency conflict', new IdempotencyConflictError('p', 'k', 't'), 409],
+    ['missing credentials', new UnauthenticatedError(), 401],
+    ['another provider', new ProviderForbiddenError('client-a', 'provider-b'), 403],
   ])('maps %s to its status', (_, error, status) => {
     expect(toErrorResponse(error)).toMatchObject({ status, code: error.code, retryable: false });
   });

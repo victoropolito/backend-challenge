@@ -1,8 +1,9 @@
-import { Body, Controller, Get, HttpCode, Inject, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { CreateWalletUseCase } from '../application/wallet/create-wallet.use-case';
 import { ReconcileWalletUseCase } from '../application/wallet/reconcile-wallet.use-case';
 import { WalletQueries } from '../application/wallet/wallet-queries';
 import { Money } from '../domain/shared/money';
+import { AuthenticationGuard } from './auth/authentication.guard';
 import { CorrelationId } from './correlation-id';
 import { ledgerPageResponse, reconciliationResponse, walletResponse } from './presenters';
 import { parseRequest } from './request-validation';
@@ -10,6 +11,7 @@ import { CreateWalletBody, LedgerQuery, WalletParams } from './schemas';
 
 /** Criação e consulta de wallets e do ledger. */
 @Controller('wallets')
+@UseGuards(AuthenticationGuard)
 export class WalletsController {
   constructor(
     @Inject(CreateWalletUseCase) private readonly createWallet: CreateWalletUseCase,

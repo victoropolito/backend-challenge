@@ -19,6 +19,8 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   INVALID_WAGER_TRANSACTION: 400,
   INVALID_WALLET_OPERATION: 400,
   INVALID_CURSOR: 400,
+  UNAUTHENTICATED: 401,
+  PROVIDER_FORBIDDEN: 403,
   WALLET_NOT_FOUND: 404,
   TRANSACTION_NOT_FOUND: 404,
   WALLET_ALREADY_EXISTS: 409,
@@ -63,7 +65,10 @@ export function toErrorResponse(exception: unknown): ErrorResponse {
   return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal error', retryable: false };
 }
 
-/** Filtro global: corpo `{ code, message, retryable, details?, correlationId }`; erros repetíveis incluem `Retry-After`. */
+/**
+ * Filtro global: corpo `{ code, message, retryable, details?, correlationId }`; erros repetíveis incluem `Retry-After`
+ * e o 401 inclui `WWW-Authenticate`.
+ */
 @Catch()
 export class HttpErrorFilter implements ExceptionFilter {
   private readonly logger = new StructuredLogger('HttpError');
@@ -92,6 +97,9 @@ export class HttpErrorFilter implements ExceptionFilter {
     }
     if (body.retryable) {
       response.setHeader('Retry-After', String(RETRY_AFTER_SECONDS));
+    }
+    if (status === 401) {
+      response.setHeader('WWW-Authenticate', 'Bearer');
     }
     response.status(status).json({ ...body, correlationId: request.correlationId ?? null });
   }

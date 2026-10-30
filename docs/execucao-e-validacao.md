@@ -72,6 +72,14 @@ bun run start | jq -c 'select(.message == "Wager transaction recorded") | {trans
 
 Linhas esperadas: `HTTP request` (uma por requisição), `Wager transaction recorded` (um desfecho novo), `Idempotent replay`, `Message failed, will retry` e `Message sent to the DLQ` (consumidor), `Wallet balance diverges from its ledger` (reconciliação). Os detalhes estão no `ARCHITECTURE.md` §12.
 
+### Autenticação
+
+A autenticação está desligada (ver `ARCHITECTURE.md` §7.6): a API aceita requisições sem `Authorization`, e o boot registra o aviso `Authentication disabled: every API request is accepted as anonymous`. Para conferir:
+
+```bash
+bun run start | jq -c 'select(.context == "Auth")'
+```
+
 ### Métricas
 
 `GET /metrics` devolve as métricas no formato do Prometheus. Para conferir à mão:

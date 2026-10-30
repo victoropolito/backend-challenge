@@ -142,6 +142,9 @@ describe('consumer and outbox publisher in the application', () => {
     });
     const walletRequest = logLines.find((line) => line.context === 'Http' && line.method === 'POST' && line.path === '/wallets');
     expect(walletRequest).toMatchObject({ level: 'info', status: 201, correlationId: expect.any(String), durationMs: expect.any(Number) });
+    expect(logLines).toContainEqual(
+      expect.objectContaining({ level: 'warn', context: 'Auth', message: 'Authentication disabled: every API request is accepted as anonymous' }),
+    );
     expect(logLines.filter((line) => JSON.stringify(line).includes('25.00') || 'amount' in line)).toEqual([]);
     await eventually(async () => expect(await queues.countMain()).toBe(0));
 
