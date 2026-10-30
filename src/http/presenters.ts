@@ -73,6 +73,7 @@ export function submissionStatus(transaction: WagerTransaction): number {
     case WagerTransactionStatus.PendingReference:
       return 202;
     case WagerTransactionStatus.Rejected:
+    case WagerTransactionStatus.Failed:
       return 422;
     default:
       return 500;

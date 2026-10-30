@@ -32,6 +32,10 @@ export interface WagerTransactionRejectedData extends WagerTransactionEventData 
   balance: MoneyProps | null;
 }
 
+export interface WagerTransactionFailedData extends WagerTransactionEventData {
+  failureCode: FailureCode;
+}
+
 export interface WagerTransactionPendingReferenceData extends WagerTransactionEventData {
   referenceExternalTransactionId: string;
   referenceCheckAttempts: number;
@@ -95,6 +99,21 @@ export class WagerTransactionPendingReference extends IntegrationEvent<WagerTran
       referenceCheckAttempts: transaction.referenceCheckAttempts,
       nextReferenceCheckAt: transaction.nextReferenceCheckAt!.toISOString(),
     });
+  }
+}
+
+/** Emitido quando uma transação já gravada termina sem ser aplicada por um erro que se repetiu até o limite de tentativas. */
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionFailedData> {
+  readonly eventType = 'WagerTransactionFailed';
+  readonly version = 1;
+
+  private constructor(ctx: EventContext, data: WagerTransactionFailedData) {
+    super({ ...ctx, aggregateId: data.transactionId, data });
+  }
+
+  static from(transaction: WagerTransaction, ctx: EventContext): WagerTransactionFailed {
+    assertStatus(transaction, WagerTransactionStatus.Failed);
+    return new WagerTransactionFailed(ctx, { ...baseData(transaction), failureCode: transaction.failureCode! });
   }
 }
 

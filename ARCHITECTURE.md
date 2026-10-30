@@ -11,7 +11,7 @@ src/
 │   ├── shared/             Money, DomainError, backoff, deepFreeze
 │   ├── wallet/             Wallet (aggregate root), WalletLedgerEntry, portas de repositório
 │   ├── wagering/           WagerTransaction, FailureCode, porta de repositório
-│   ├── events/             IntegrationEvent e os 4 eventos de integração
+│   ├── events/             IntegrationEvent e os 5 eventos de integração
 │   └── messaging/          InboxMessage, OutboxMessage, portas de repositório
 ├── infrastructure/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
@@ -20,7 +20,7 @@ src/
 ├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
 ├── http/                   controllers, validação (Zod), correlation id, filtro de erros
 ├── consumer/               consumidor SQS: leitura das mensagens, classificação de falhas, loop, DLQ, shutdown
-├── workers/                processos em segundo plano: publisher da outbox
+├── workers/                processos em segundo plano: publisher da outbox e worker de PENDING_REFERENCE
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
@@ -100,7 +100,7 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
 | `REFERENCE_NOT_PROCESSED` | REJECTED | referência existe mas não está `PROCESSED` | desistir |
 | `REFERENCE_AMOUNT_MISMATCH` | REJECTED | valor da reversão diferente do valor da referência | corrigir o payload |
 | `REFERENCE_ALREADY_REVERSED` | REJECTED | a referência já foi revertida | desistir (já aplicado) |
-| `PROCESSING_ERROR` | FAILED | erro permanente de infraestrutura | auditar |
+| `PROCESSING_ERROR` | FAILED | uma transação `PENDING_REFERENCE` falhou com erro inesperado em todas as verificações até o limite (seção 10.3) | auditar |
 
 `INSUFFICIENT_BALANCE` e `REVERSAL_INSUFFICIENT_BALANCE` são distintos de propósito (regra 7.9): uma aposta sem saldo é rotina, uma reversão impossível indica inconsistência operacional entre provider e carteira.
 
@@ -108,7 +108,7 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
 
 - `IntegrationEvent<T>` é a classe abstrata do envelope; cada evento concreto fixa `eventType` e `version` no tipo e só é criado por `from()`, que confere o estado da origem (ex.: `WagerTransactionRejected` exige uma transação `REJECTED`).
 - `data` contém só JSON estável: `MoneyProps` (nunca a instância de `Money`), datas ISO-8601 e `null` para ausência. É clonado e congelado recursivamente.
-- `WagerTransactionProcessed` inclui o saldo observado da transação, inclusive para `LOSS`. `WagerTransactionRejected` inclui o saldo observado quando houver (ou `null`).
+- `WagerTransactionProcessed` inclui o saldo observado da transação, inclusive para `LOSS`. `WagerTransactionRejected` inclui o saldo observado quando houver (ou `null`). `WagerTransactionFailed` traz o `failureCode` (`PROCESSING_ERROR`) e é emitido só pelo worker de `PENDING_REFERENCE`.
 - `OutboxMessage.enqueue(event)` usa o próprio `eventId` como id da mensagem: republicações carregam o mesmo id e o consumidor deduplica por ele. Retry com backoff exponencial (1 s até o teto de 5 min) e **sem limite de tentativas**: um evento confirmado não pode ser descartado, e uma falha persistente deve aparecer na métrica de atraso da outbox.
 - `InboxMessage` é identificada por `(consumerName, messageId)` e só pode ser marcada como processada uma vez.
 
@@ -125,7 +125,8 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
   4. `WagerTransactionProcessor` decide e grava tudo na mesma transação: transação, lançamento, saldo (`update` com verificação de versão) e eventos na outbox. Quando a submissão vem da fila, a mensagem de origem é gravada na inbox nessa mesma transação (seção 8.2).
   5. Se mesmo assim o insert colidir na unicidade (concorrência sem lock comum, por exemplo com uma wallet inexistente), a transação é desfeita e a submissão anterior é relida: vira replay ou conflito, nunca duplicação.
 - **Ordem das regras no processor:** wallet inexistente (`WALLET_NOT_FOUND`) → wallet de outro jogador (`WALLET_PLAYER_MISMATCH`) → moeda (`CURRENCY_MISMATCH`) → referência (ausente ⇒ `PENDING_REFERENCE`; senão `checkReference`) → reversão única (`REFERENCE_ALREADY_REVERSED`) → saldo (`INSUFFICIENT_BALANCE` para `BET`, `REVERSAL_INSUFFICIENT_BALANCE` para `ROLLBACK` que debitaria) → aplica. Toda rejeição é gravada (auditável e idempotente) e gera `WagerTransactionRejected`.
-- O processor é separado do caso de uso para ser reutilizado pelo worker de `PENDING_REFERENCE`: ele aceita uma transação nova (`PENDING`, inserida) ou já gravada (`PENDING_REFERENCE`, atualizada), e quem chama decide o que fazer quando a referência continua ausente (`onMissingReference`). Na submissão, a primeira verificação fica agendada para `agora + 1 s` (backoff exponencial até 60 s; o limite de tentativas entra com o worker).
+- O processor é separado do caso de uso para ser reutilizado pelo worker de `PENDING_REFERENCE`: ele aceita uma transação nova (`PENDING`, inserida) ou já gravada (`PENDING_REFERENCE`, atualizada), e quem chama decide o que fazer quando a referência continua ausente (`onMissingReference`, que recebe a referência encontrada, se ela existe mas ainda espera, e o saldo do momento). Na submissão, a primeira verificação fica agendada para `agora + 1 s`; as seguintes, e o limite, são do worker (seção 10).
+- Quando uma transação termina (`PROCESSED`, `REJECTED` ou `FAILED`), o processor antecipa para agora a próxima verificação das transações `PENDING_REFERENCE` da mesma wallet que esperam por ela (`scheduleReferenceChecksFor`), na mesma transação SQL. Assim, quem chegou antes da referência é aplicado no próximo ciclo do worker, e não só no fim do backoff.
 
 ## 4. Persistência
 
@@ -201,11 +202,11 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 | Payload inválido (formato, tipo, campo ausente, valor com mais de 2 casas, regra de formato do domínio) | 400 | `VALIDATION_ERROR`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`, `INVALID_WALLET_OPERATION`, `INVALID_CURSOR`, `MALFORMED_REQUEST` | só depois de corrigir |
 | Recurso inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `NOT_FOUND` | — |
 | Conflito: wallet duplicada, idempotency key com outro payload, `externalTransactionId` sob outra chave | 409 | `WALLET_ALREADY_EXISTS`, `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT` | não com a mesma chave |
-| Rejeição por regra de negócio (transação gravada como `REJECTED`) | 422 | corpo traz o `failureCode` | não; ver ação na seção 3.4 |
+| Rejeição por regra de negócio (transação gravada como `REJECTED`), ou transação que terminou `FAILED` | 422 | corpo traz o `failureCode` | não; ver ação na seção 3.4 |
 | Falha transitória de infraestrutura (conexão, deadlock, lock timeout) | 503 + `Retry-After` | `SERVICE_UNAVAILABLE`, `WALLET_CONCURRENT_MODIFICATION` | **sim**, com a mesma chave |
 | Erro inesperado (bug) | 500 | `INTERNAL_ERROR` | sim; a submissão é atômica e idempotente |
 
-- **O replay devolve o mesmo status e o mesmo corpo da primeira resposta**, mudando só `idempotentReplay` para `true`: 200 para aplicada, 422 para rejeitada, 202 para pendente (com o estado atual dela).
+- **O replay devolve o mesmo status e o mesmo corpo da primeira resposta**, mudando só `idempotentReplay` para `true`: 200 para aplicada, 422 para rejeitada, 202 para pendente (com o estado atual dela). Uma transação que estava `PENDING_REFERENCE` e já terminou responde pelo estado atual (200, ou 422 para `REJECTED` e `FAILED`).
 - Uma rejeição de negócio é **resposta**, não erro: a transação existe, tem id e é consultável. Por isso o corpo do 422 é o mesmo formato da submissão (`transactionId`, `status`, `failureCode`, `balance`, `idempotentReplay`), e não o formato de erro.
 - 503 só é usado quando é seguro repetir: a transação SQL foi desfeita por inteiro, e a idempotência garante que um reenvio que encontre a operação já aplicada vira replay.
 - Códigos de domínio que não estão na tabela (ex.: `INVALID_TRANSACTION_STATE`) indicam bug e viram 500 sem expor a mensagem interna.
@@ -258,7 +259,7 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 | Falha transitória | erros transitórios do banco (conexão, deadlock, lock timeout), `WALLET_CONCURRENT_MODIFICATION`, `DUPLICATE_INBOX_MESSAGE` sem registro visível | nova tentativa com backoff; esgotado o limite, DLQ |
 | Falha inesperada (bug) | qualquer outro erro | tratada como transitória até o limite (pode ser passageira), registrada como erro |
 
-**`FAILED`/`PROCESSING_ERROR` não é produzido pelo consumidor.** Uma falha que esgota as tentativas não tem estado confirmado para anotar, porque a transação SQL foi desfeita por inteiro. Gravar `FAILED` ainda exigiria o banco, que pode ser justamente o que está fora. O registro da falha é a mensagem na DLQ, e reprocessá-la (redrive) é seguro pela idempotência. O status continua no modelo, reservado para falhas permanentes de transações já gravadas (worker de `PENDING_REFERENCE`).
+**`FAILED`/`PROCESSING_ERROR` não é produzido pelo consumidor.** Uma falha que esgota as tentativas não tem estado confirmado para anotar, porque a transação SQL foi desfeita por inteiro. Gravar `FAILED` ainda exigiria o banco, que pode ser justamente o que está fora. O registro da falha é a mensagem na DLQ, e reprocessá-la (redrive) é seguro pela idempotência. O status é produzido só pelo worker de `PENDING_REFERENCE`, para transações já gravadas (seção 10.3).
 
 ### 8.4 Loop de consumo
 
@@ -320,7 +321,40 @@ Cada lote é **uma transação SQL** (`PublishOutboxUseCase`):
 
 Configuração: `SQS_EVENTS_QUEUE_NAME`, `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_BATCH_SIZE` (10), `OUTBOX_IDLE_DELAY_MS` (500), `OUTBOX_PUBLISH_TIMEOUT_MS` (5000). O readiness também confere a fila de eventos.
 
-## 10. Interpretações adotadas
+## 10. Referências fora de ordem (`PENDING_REFERENCE`)
+
+### 10.1 Algoritmo
+
+`RecheckPendingReferencesUseCase` processa um lote de transações vencidas (`status = 'PENDING_REFERENCE' AND next_reference_check_at <= agora`, pelo índice parcial `wager_transactions_pending_reference_due_idx`, das mais atrasadas para as mais recentes). Cada uma é reverificada na **própria transação SQL**:
+
+1. trava a wallet (`SELECT ... FOR UPDATE`), o mesmo lock da submissão;
+2. relê a transação; se ela já não está `PENDING_REFERENCE` ou não está mais vencida, outra instância chegou antes, e ela é pulada;
+3. chama o mesmo `WagerTransactionProcessor` da submissão, com as mesmas regras e na mesma ordem: referência encontrada → aplica ou rejeita (`checkReference`, reversão única, saldo); ainda ausente → próxima verificação com backoff, ou rejeição no limite;
+4. commit.
+
+A busca dos vencidos não trava nada: travar a linha da transação antes da wallet inverteria a ordem de locks da submissão (wallet → linhas) e abriria espaço para deadlock. Duas instâncias podem pegar o mesmo candidato. Elas se serializam no lock da wallet, e a segunda o encontra já tratado no passo 2, então nunca há aplicação dupla.
+
+### 10.2 Backoff e limite
+
+- **Backoff exponencial** de 1 s a 60 s (`DEFAULT_REFERENCE_CHECK_POLICY`): 1 s, 2 s, 4 s… até 60 s entre verificações.
+- **Limite:** `REFERENCE_CHECK_MAX_ATTEMPTS` verificações (padrão **15**, contando a da submissão), ou cerca de **9 minutos** entre a chegada e a desistência. O prazo cobre o atraso normal de uma referência que chegou fora de ordem, inclusive se a mensagem dela precisou de todas as novas tentativas do consumidor (5 tentativas com backoff de até 60 s, cerca de 3 min). Ele também evita que uma transação fique "em aberto" indefinidamente para o provider.
+- **Esgotado o limite:** `REJECTED` com `REFERENCE_NOT_FOUND`, guardando o saldo do momento, e `WagerTransactionRejected` publicado. Se a referência existe mas ainda está esperando a própria referência, o código é `REFERENCE_NOT_PROCESSED`, com o id dela.
+- **Antecipação:** quando a referência chega e termina, as transações que esperavam por ela são reagendadas para agora (seção 3.6). Na prática, uma transação fora de ordem é aplicada em até `REFERENCE_WORKER_IDLE_DELAY_MS` (1 s) depois da chegada da referência. O backoff só determina quanto tempo ela espera **enquanto** a referência não chega.
+- `WagerTransactionPendingReference` é publicado só na entrada em `PENDING_REFERENCE`; as novas verificações não repetem o evento.
+
+### 10.3 Falhas
+
+- **Erro transitório do banco** (conexão, deadlock, lock timeout): não conta como tentativa. A transação continua vencida e é reverificada no próximo ciclo.
+- **Erro inesperado** (bug, dado que o processor não consegue tratar): conta como tentativa. A transação é reagendada com o backoff, numa transação SQL separada, para não ficar presa no topo da fila. No limite, termina `FAILED` com `PROCESSING_ERROR`, e `WagerTransactionFailed` é publicado. É o único caminho que produz `FAILED`: a transação já estava gravada, então há um estado a registrar (diferente do consumidor; ver seção 8.3).
+- Os eventos das verificações têm `correlationId` novo e `causationId` = id da transação, porque o correlation id da requisição original não é guardado.
+
+### 10.4 Worker
+
+`PendingReferenceWorker`, ligado ao NestJS por `PendingReferenceModule`, roda em todas as instâncias. O loop é o mesmo do publisher da outbox (`PollingLoop`): sem pausa enquanto os lotes vêm cheios; espera `REFERENCE_WORKER_IDLE_DELAY_MS` (1 s) quando não há mais vencidas ou houve erro; no shutdown, interrompe a espera e conclui o lote em andamento. Erros por transação são registrados e não interrompem o lote.
+
+Configuração: `REFERENCE_WORKER_ENABLED`, `REFERENCE_WORKER_BATCH_SIZE` (20), `REFERENCE_WORKER_IDLE_DELAY_MS` (1000), `REFERENCE_CHECK_MAX_ATTEMPTS` (15).
+
+## 11. Interpretações adotadas
 
 | Tema | Interpretação | Motivo |
 |---|---|---|
@@ -331,11 +365,13 @@ Configuração: `SQS_EVENTS_QUEUE_NAME`, `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_BAT
 | `WIN`/`LOSS` com referência | Opcional; quando presente, deve apontar para uma `BET` da mesma rodada; o valor de `WIN` pode diferir do da `BET` | Um prêmio não tem o valor da aposta |
 | Referência ainda pendente | Se a referência existe mas está `PENDING_REFERENCE` (esperando a própria referência), a transação também fica `PENDING_REFERENCE`, em vez de ser rejeitada com `REFERENCE_NOT_PROCESSED` | A referência ainda pode ser processada; rejeitar agora dependeria da ordem de chegada |
 | Referência ausente em `WIN`/`LOSS` | Quando informada e ainda não recebida, também gera `PENDING_REFERENCE` | A regra 8 do enunciado vale para qualquer referência ausente |
+| Limite de `PENDING_REFERENCE` | 15 verificações com backoff de 1 s a 60 s (cerca de 9 min) | Cobre o atraso normal de uma referência fora de ordem, inclusive com as novas tentativas do consumidor, e dá ao provider uma resposta definitiva em minutos (seção 10.2) |
+| Referência ainda pendente no limite | `REFERENCE_NOT_PROCESSED` (com o id da referência), e não `REFERENCE_NOT_FOUND` | A referência existe; o problema é que ela não foi aplicada |
 | Saldo em rejeições | Rejeições depois da validação da wallet guardam e devolvem o saldo do momento; `WALLET_NOT_FOUND`, `WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH` não devolvem saldo | Não expor o saldo da wallet de outro jogador; na moeda errada, não há saldo comparável |
 | Mesmo `externalTransactionId` com outra idempotency key | Conflito, não replay | O header é a fonte da verdade da idempotência |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
 
-## 11. Limitações conhecidas
+## 12. Limitações conhecidas
 
 - **Ordem dos eventos entre publishers:** um lote é publicado na ordem de gravação, mas dois publishers podem pegar eventos consecutivos do mesmo agregado em lotes diferentes, e o segundo lote pode chegar antes. Os consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e `occurredAt` para ordenar, e não a ordem de chegada.
 - Linhas publicadas da outbox não são apagadas: a tabela cresce sem limite. Uma rotina de limpeza (apagar publicadas com mais de N dias) fica para depois.
@@ -348,9 +384,12 @@ Configuração: `SQS_EVENTS_QUEUE_NAME`, `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_BAT
 - A imutabilidade do ledger é garantida por trigger, que vale para qualquer role. Restringir permissões por role no banco (aplicação sem `UPDATE`/`DELETE`) ficou de fora, porque o ambiente local usa um único usuário.
 - Ledger de partidas simples (sem conta de contrapartida da casa).
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
-- O status `FAILED`/`PROCESSING_ERROR` ainda não é produzido: erros de infraestrutura desfazem a transação SQL inteira e são repetidos (HTTP 503 ou nova entrega da fila). Ver a seção 8.3.
+- `FAILED`/`PROCESSING_ERROR` só é produzido pelo worker de `PENDING_REFERENCE`. Na submissão, erros de infraestrutura desfazem a transação SQL inteira e são repetidos (HTTP 503 ou nova entrega da fila); ver a seção 8.3.
+- Uma transação rejeitada com `REFERENCE_NOT_FOUND` não é revivida se a referência chegar depois: o provider precisa reenviá-la com outra idempotency key (a mesma chave devolve a rejeição original).
+- Instâncias diferentes do worker de `PENDING_REFERENCE` podem buscar os mesmos candidatos e se serializar no lock da wallet: a segunda só descobre que a transação já foi tratada. É trabalho repetido, sem efeito na correção; com muitas pendentes, o ganho de mais instâncias é menor que no publisher da outbox, que divide o trabalho com `SKIP LOCKED`.
+- A antecipação da verificação vale só para transações da mesma wallet da referência; as de outra wallet seriam rejeitadas por `REFERENCE_MISMATCH` de qualquer forma, e isso acontece na próxima verificação agendada delas.
 
-## 12. Testes
+## 13. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
 - **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
@@ -358,8 +397,9 @@ Configuração: `SQS_EVENTS_QUEUE_NAME`, `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_BAT
 - **Consumidor SQS no LocalStack real** (filas FIFO e DLQ descartáveis por teste, com a mesma `RedrivePolicy`): aplicação e confirmação após o commit, rejeição de negócio confirmada sem retry, redelivery e reenvio aplicados uma vez, mensagem já commitada antes de um "crash" confirmada sem reaplicar, mensagem malformada e conflito de idempotência direto para a DLQ com os atributos de falha, falha transitória repetida com backoff até dar certo, tentativas esgotadas indo para a DLQ, ordem dentro do grupo com grupos em paralelo, shutdown que espera a mensagem em andamento e para de receber, e timeout de shutdown que devolve a visibilidade (outra instância processa logo, sem esperar os 30 s). Mais um teste sobe a aplicação Nest real com o consumidor ligado pela config e o para no `close()`. Mutações conferidas: sem devolver a visibilidade e sem ordem por grupo, os testes falham.
 - **Shutdown com `SIGTERM` real** (`scripts/sigterm-check.sh`, manual): a aplicação num container Linux recebe `docker stop` no meio de uma rajada de mensagens; o script confere transações = ledger = inbox e saldos corretos logo depois do sinal e, após o restart, que tudo foi aplicado exatamente uma vez. Ver `docs/execucao-e-validacao.md` §7.
 - **Outbox:** o caso de uso de publicação é testado no banco real com um publisher em memória: ordem de gravação, tamanho do lote, mensagens ainda não vencidas puladas, recusa parcial com backoff, destino fora do ar com nova tentativa depois, um segundo publisher pulando as linhas travadas pelo primeiro, 5 publishers concorrentes sobre 200 mensagens (cada uma publicada exatamente uma vez) e morte depois de publicar e antes do commit (republicação com o mesmo id). O `SqsEventPublisher` e o worker são testados no LocalStack real: formato da mensagem, deduplicação pelo `eventId`, fila inexistente, eventos gravados com nenhum publisher no ar sendo publicados depois, 3 workers simultâneos (cada evento recebido uma vez) e parada rápida. Mutações conferidas: sem a trava, há publicação duplicada; com `FOR UPDATE` sem `SKIP LOCKED`, os publishers ficam esperando uns pelos outros.
+- **`PENDING_REFERENCE`:** o caso de uso de reverificação é testado no banco real, com relógio controlado: `WIN` aplicado logo que a `BET` chega (verificação antecipada pela chegada), transação não verificada antes do vencimento, novo agendamento com backoff sem repetir o evento, `REFERENCE_NOT_FOUND` no limite com o saldo do momento, `REFERENCE_NOT_PROCESSED` quando a referência ainda espera no limite, dependente de uma transação rejeitada verificado e rejeitado na hora, cadeia recebida de trás para frente (`ROLLBACK`, `WIN`, `BET`) resolvida inteira, dois `REFUND`s esperando a mesma `BET` (só um aplicado), erro inesperado contando tentativa até `FAILED`/`PROCESSING_ERROR`, erro transitório sem contar tentativa e 4 reverificações concorrentes sobre 24 transações em 8 wallets (cada uma aplicada exatamente uma vez). O worker é testado com o loop real, e a aplicação Nest real aplica pela fila um `WIN` recebido antes da `BET`. Mutações conferidas: sem o lock da wallet, ou sem reler a transação depois do lock, o teste concorrente falha.
 - Nenhum mock de banco nem de fila. **Planejado:** testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
-## 13. Pendências
+## 14. Pendências
 
-Worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

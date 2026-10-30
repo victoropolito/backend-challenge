@@ -39,7 +39,7 @@ curl localhost:3000/health/live     # 200 {"status":"ok"}
 curl localhost:3000/health/ready    # 200 com postgres e sqs "up"; 503 se algum estiver fora
 ```
 
-A aplicação sobe a API HTTP, o consumidor da fila e o publisher da outbox no mesmo processo. Variáveis principais (todas em `.env.example`):
+A aplicação sobe a API HTTP, o consumidor da fila, o publisher da outbox e o worker de `PENDING_REFERENCE` no mesmo processo. Variáveis principais (todas em `.env.example`):
 
 | Variável | Padrão | Efeito |
 |---|---|---|
@@ -55,6 +55,9 @@ A aplicação sobe a API HTTP, o consumidor da fila e o publisher da outbox no m
 | `OUTBOX_PUBLISHER_ENABLED` | `true` | liga o publisher da outbox |
 | `OUTBOX_BATCH_SIZE` / `OUTBOX_IDLE_DELAY_MS` | `10` / `500` | mensagens por lote; espera quando a outbox está vazia |
 | `OUTBOX_PUBLISH_TIMEOUT_MS` | `5000` | limite de cada chamada ao SQS (a transação do lote fica aberta durante a publicação) |
+| `REFERENCE_WORKER_ENABLED` | `true` | liga o worker que reverifica as transações `PENDING_REFERENCE` |
+| `REFERENCE_WORKER_BATCH_SIZE` / `REFERENCE_WORKER_IDLE_DELAY_MS` | `20` / `1000` | transações por lote; espera quando não há vencidas |
+| `REFERENCE_CHECK_MAX_ATTEMPTS` | `15` | verificações até desistir com `REFERENCE_NOT_FOUND` (cerca de 9 min; use `3` para ver a desistência em ~7 s) |
 
 ## 4. Testes automatizados
 
@@ -65,7 +68,7 @@ bun run test:unit             # só unitários (sem infra)
 bun run test:integration      # PostgreSQL e LocalStack reais
 ```
 
-Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes de mensageria criam filas `wager-test-<aleatório>.fifo` + DLQ + eventos (removidas no fim). Os testes HTTP desligam o consumidor e o publisher da outbox.
+Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes de mensageria criam filas `wager-test-<aleatório>.fifo` + DLQ + eventos (removidas no fim). Os testes HTTP desligam o consumidor, o publisher da outbox e o worker de `PENDING_REFERENCE`.
 
 ## 5. Validação manual da API
 
@@ -90,6 +93,25 @@ curl -s -X POST localhost:3000/wagering/transactions -H 'content-type: applicati
 | com outra chave e o mesmo `externalTransactionId` | 409 `EXTERNAL_TRANSACTION_ID_CONFLICT` |
 | com novo id/chave e `amount` maior que o saldo | 422, `failureCode: INSUFFICIENT_BALANCE` |
 | `REFUND` referenciando um `externalTransactionId` que não existe | 202, `status: PENDING_REFERENCE` |
+
+### Referência fora de ordem
+
+Um `WIN` que chega antes da sua `BET` fica `PENDING_REFERENCE` e é aplicado pelo worker logo que a `BET` chega:
+
+```bash
+WIN='{"providerId":"provider-a","externalTransactionId":"win-1","playerId":"player-1","walletId":"'$WALLET'","roundId":"r-1","gameId":"g-1","kind":"WIN","money":{"amount":"40.00","currency":"BRL"},"referenceExternalTransactionId":"bet-1"}'
+BET='{"providerId":"provider-a","externalTransactionId":"bet-1","playerId":"player-1","walletId":"'$WALLET'","roundId":"r-1","gameId":"g-1","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}'
+curl -s -X POST localhost:3000/wagering/transactions -H 'content-type: application/json' -H 'Idempotency-Key: provider-a:win-1' -d "$WIN"   # 202, PENDING_REFERENCE
+curl -s -X POST localhost:3000/wagering/transactions -H 'content-type: application/json' -H 'Idempotency-Key: provider-a:bet-1' -d "$BET"   # 200
+curl -s localhost:3000/providers/provider-a/wagering/transactions/win-1   # PROCESSED em até ~1 s
+```
+
+Se a `BET` nunca chegar, o `WIN` termina `REJECTED` com `REFERENCE_NOT_FOUND` depois de `REFERENCE_CHECK_MAX_ATTEMPTS` verificações (com `REFERENCE_CHECK_MAX_ATTEMPTS=3`, em ~7 s). Para ver o que está esperando:
+
+```bash
+docker compose exec -T postgres psql -U wagering -d wagering -c \
+  "select external_transaction_id, reference_external_transaction_id, reference_check_attempts, next_reference_check_at from wager_transactions where status = 'PENDING_REFERENCE' order by next_reference_check_at"
+```
 
 Consultas: `GET /wallets/$WALLET`, `GET /wallets/$WALLET/ledger?limit=2` (siga o `nextCursor`), `GET /wagering/transactions/<transactionId>`, `GET /providers/provider-a/wagering/transactions/tx-1`. A tabela completa de status está no `ARCHITECTURE.md` §7.1.
 

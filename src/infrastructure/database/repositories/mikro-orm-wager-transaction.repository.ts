@@ -1,4 +1,4 @@
-import type { EntityManager } from '@mikro-orm/postgresql';
+import { QueryOrder, type EntityManager } from '@mikro-orm/postgresql';
 import type { FailureCode } from '../../../domain/wagering/failure-code';
 import { Money } from '../../../domain/shared/money';
 import {
@@ -45,6 +45,29 @@ export class MikroOrmWagerTransactionRepository extends WagerTransactionReposito
       kind: { $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback] },
     });
     return count > 0;
+  }
+
+  async findDueReferenceChecks(now: Date, limit: number): Promise<WagerTransaction[]> {
+    const records = await this.em.find(
+      WagerTransactionSchema,
+      { status: WagerTransactionStatus.PendingReference, nextReferenceCheckAt: { $lte: now } },
+      { orderBy: { nextReferenceCheckAt: QueryOrder.ASC, id: QueryOrder.ASC }, limit, disableIdentityMap: true },
+    );
+    return records.map(toDomain);
+  }
+
+  async scheduleReferenceChecksFor(reference: WagerTransaction, at: Date): Promise<number> {
+    return this.em.nativeUpdate(
+      WagerTransactionSchema,
+      {
+        status: WagerTransactionStatus.PendingReference,
+        providerId: reference.providerId,
+        referenceExternalTransactionId: reference.externalTransactionId,
+        walletId: reference.walletId,
+        nextReferenceCheckAt: { $gt: at },
+      },
+      { nextReferenceCheckAt: at },
+    );
   }
 
   async insert(transaction: WagerTransaction): Promise<void> {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { InvalidIntegrationEventError, type EventContext } from '../../../../src/domain/events/integration-event';
 import { WalletBalanceChanged } from '../../../../src/domain/events/wallet-balance-changed';
 import {
+  WagerTransactionFailed,
   WagerTransactionPendingReference,
   WagerTransactionProcessed,
   WagerTransactionRejected,
@@ -204,6 +205,26 @@ describe('WagerTransactionPendingReference', () => {
   it('requires a PENDING_REFERENCE transaction', () => {
     const tx = transaction({ kind: Kind.Rollback, referenceExternalTransactionId: 'ext-0' });
     expect(() => WagerTransactionPendingReference.from(tx, ctx)).toThrow(InvalidIntegrationEventError);
+  });
+});
+
+describe('WagerTransactionFailed', () => {
+  it('carries the failure code', () => {
+    const tx = transaction({ kind: Kind.Win, referenceExternalTransactionId: 'ext-0' });
+    tx.markPendingReference(new Date('2026-10-30T12:00:05Z'));
+    tx.fail(FailureCode.ProcessingError);
+    const event = WagerTransactionFailed.from(tx, ctx);
+
+    expect(event.eventType).toBe('WagerTransactionFailed');
+    expect(event.aggregateId).toBe('tx-1');
+    expect(event.data.failureCode).toBe(FailureCode.ProcessingError);
+    expect(event.data.referenceExternalTransactionId).toBe('ext-0');
+  });
+
+  it('requires a FAILED transaction', () => {
+    const tx = transaction();
+    tx.reject(FailureCode.InsufficientBalance);
+    expect(() => WagerTransactionFailed.from(tx, ctx)).toThrow(InvalidIntegrationEventError);
   });
 });
 

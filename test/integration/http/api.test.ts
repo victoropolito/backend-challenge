@@ -10,12 +10,14 @@ let baseUrl: string;
 const originalDatabaseUrl = process.env.DATABASE_URL;
 const originalConsumerEnabled = process.env.SQS_CONSUMER_ENABLED;
 const originalPublisherEnabled = process.env.OUTBOX_PUBLISHER_ENABLED;
+const originalReferenceWorkerEnabled = process.env.REFERENCE_WORKER_ENABLED;
 
 beforeAll(async () => {
   db = await createTestDatabase();
   process.env.DATABASE_URL = db.url;
   process.env.SQS_CONSUMER_ENABLED = 'false';
   process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
+  process.env.REFERENCE_WORKER_ENABLED = 'false';
   app = await createHttpApp({ logger: false });
   await app.listen(0);
   baseUrl = (await app.getUrl()).replace('[::1]', 'localhost');
@@ -27,6 +29,7 @@ afterAll(async () => {
   for (const [key, value] of [
     ['SQS_CONSUMER_ENABLED', originalConsumerEnabled],
     ['OUTBOX_PUBLISHER_ENABLED', originalPublisherEnabled],
+    ['REFERENCE_WORKER_ENABLED', originalReferenceWorkerEnabled],
   ] as const) {
     if (value === undefined) {
       delete process.env[key];

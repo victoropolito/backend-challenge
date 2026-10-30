@@ -1,10 +1,7 @@
 import type { PublishOutboxUseCase } from '../application/messaging/publish-outbox.use-case';
+import { describeError, PollingLoop, type WorkerLogger } from './polling-loop';
 
-export interface WorkerLogger {
-  log(message: string): void;
-  warn(message: string): void;
-  error(message: string, stack?: string): void;
-}
+export type { WorkerLogger } from './polling-loop';
 
 export interface OutboxPublisherWorkerOptions {
   batchSize: number;
@@ -24,58 +21,29 @@ export interface OutboxPublisherWorkerDependencies {
  * `stop` interrompe a espera e aguarda o lote em andamento.
  */
 export class OutboxPublisherWorker {
-  private running = false;
-  private loop: Promise<void> | undefined;
-  private wakeUp: (() => void) | undefined;
+  private readonly loop: PollingLoop;
 
-  constructor(private readonly deps: OutboxPublisherWorkerDependencies) {}
-
-  start(): void {
-    if (this.running) {
-      return;
-    }
-    this.running = true;
-    this.loop = this.run();
-  }
-
-  async stop(): Promise<void> {
-    this.running = false;
-    this.wakeUp?.();
-    await this.loop;
-  }
-
-  private async run(): Promise<void> {
-    const { publish, logger, options } = this.deps;
-    while (this.running) {
-      try {
+  constructor(deps: OutboxPublisherWorkerDependencies) {
+    const { publish, logger, options } = deps;
+    this.loop = new PollingLoop({
+      idleDelayMs: options.idleDelayMs,
+      tick: async () => {
         const result = await publish.execute(options.batchSize);
         for (const [id, reason] of result.failures) {
           logger.warn(`Event ${id} not published, will retry: ${reason}`);
         }
-        if (result.claimed < options.batchSize || result.failures.size > 0) {
-          await this.pause(options.idleDelayMs);
-        }
-      } catch (error) {
-        logger.error(
-          `Outbox batch failed: ${error instanceof Error ? error.message || error.name : String(error)}`,
-          error instanceof Error ? error.stack : undefined,
-        );
-        await this.pause(options.idleDelayMs);
-      }
-    }
+        return result.claimed === options.batchSize && result.failures.size === 0;
+      },
+      onError: (error) =>
+        logger.error(`Outbox batch failed: ${describeError(error)}`, error instanceof Error ? error.stack : undefined),
+    });
   }
 
-  private pause(ms: number): Promise<void> {
-    if (!this.running) {
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      const timer = setTimeout(done, ms);
-      function done() {
-        clearTimeout(timer);
-        resolve();
-      }
-      this.wakeUp = done;
-    });
+  start(): void {
+    this.loop.start();
+  }
+
+  stop(): Promise<void> {
+    return this.loop.stop();
   }
 }

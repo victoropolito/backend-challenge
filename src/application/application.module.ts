@@ -2,6 +2,8 @@ import { Module, type Provider } from '@nestjs/common';
 import { InboxRepository, OutboxRepository } from '../domain/messaging/messaging-repositories';
 import { WagerTransactionRepository } from '../domain/wagering/wager-transaction-repository';
 import { LedgerRepository, WalletRepository } from '../domain/wallet/wallet-repository';
+import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import { isTransientDatabaseError } from '../infrastructure/database/transient-error';
 import { SystemClock } from '../infrastructure/system/system-clock';
 import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
 import { EventPublisher } from './messaging/event-publisher';
@@ -10,6 +12,7 @@ import { Clock } from './shared/clock';
 import { IdGenerator } from './shared/id-generator';
 import { TransactionRunner } from './shared/transaction-runner';
 import { ConsumeWagerTransactionMessageUseCase } from './wagering/consume-wager-transaction-message.use-case';
+import { RecheckPendingReferencesUseCase } from './wagering/recheck-pending-references.use-case';
 import { SubmitWagerTransactionUseCase } from './wagering/submit-wager-transaction.use-case';
 import { WagerTransactionQueries } from './wagering/wager-transaction-queries';
 import { WagerTransactionProcessor } from './wagering/wager-transaction-processor';
@@ -59,6 +62,29 @@ const USE_CASES: Provider[] = [
     inject: [TransactionRunner, OutboxRepository, EventPublisher, Clock],
     useFactory: (transactions: TransactionRunner, outbox: OutboxRepository, publisher: EventPublisher, clock: Clock) =>
       new PublishOutboxUseCase({ transactions, outbox, publisher, clock }),
+  },
+  {
+    provide: RecheckPendingReferencesUseCase,
+    inject: [APP_CONFIG, TransactionRunner, WalletRepository, WagerTransactionRepository, WagerTransactionProcessor, Clock, IdGenerator],
+    useFactory: (
+      config: AppConfig,
+      transactions: TransactionRunner,
+      wallets: WalletRepository,
+      wagerTransactions: WagerTransactionRepository,
+      processor: WagerTransactionProcessor,
+      clock: Clock,
+      ids: IdGenerator,
+    ) =>
+      new RecheckPendingReferencesUseCase({
+        transactions,
+        wallets,
+        wagerTransactions,
+        processor,
+        clock,
+        ids,
+        maxAttempts: config.referenceWorker.maxAttempts,
+        isTransientError: isTransientDatabaseError,
+      }),
   },
   {
     provide: ConsumeWagerTransactionMessageUseCase,

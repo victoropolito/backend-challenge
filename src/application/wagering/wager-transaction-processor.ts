@@ -1,5 +1,7 @@
 import type { EventContext } from '../../domain/events/integration-event';
+import type { Money } from '../../domain/shared/money';
 import {
+  WagerTransactionFailed,
   WagerTransactionPendingReference,
   WagerTransactionProcessed,
   WagerTransactionRejected,
@@ -19,12 +21,21 @@ import { LedgerDirection, type WalletLedgerEntry } from '../../domain/wallet/wal
 import type { LedgerRepository, WalletRepository } from '../../domain/wallet/wallet-repository';
 import type { IdGenerator } from '../shared/id-generator';
 
-export interface ProcessingContext {
+export interface MissingReference {
+  /** A referência, quando já existe mas ainda aguarda a própria referência. */
+  reference: WagerTransaction | undefined;
+  observedBalance: Money;
+}
+
+export interface EventOrigin {
   now: Date;
   correlationId: string;
   causationId?: string | undefined;
+}
+
+export interface ProcessingContext extends EventOrigin {
   /** Chamado quando a referência ainda não existe ou ainda aguarda a própria referência; deve levar a transação a PENDING_REFERENCE ou REJECTED. */
-  onMissingReference(transaction: WagerTransaction): void;
+  onMissingReference(transaction: WagerTransaction, missing: MissingReference): void;
 }
 
 export interface WagerTransactionProcessorDependencies {
@@ -37,7 +48,8 @@ export interface WagerTransactionProcessorDependencies {
 
 /**
  * Decide o desfecho de uma transação PENDING (nova, ainda não gravada) ou PENDING_REFERENCE (já gravada) e grava
- * transação, lançamento, saldo e eventos. Precisa rodar dentro de uma transação SQL com a wallet travada.
+ * transação, lançamento, saldo e eventos. Quando a transação termina, antecipa a verificação das que esperam por ela.
+ * Precisa rodar dentro de uma transação SQL com a wallet travada.
  */
 export class WagerTransactionProcessor {
   constructor(private readonly deps: WagerTransactionProcessorDependencies) {}
@@ -60,7 +72,28 @@ export class WagerTransactionProcessor {
       await this.deps.ledger.insert(entry);
       await this.deps.wallets.update(wallet!, expectedVersion!);
     }
-    await this.enqueueEvents(transaction, previousStatus, wallet, entry, context);
+    await this.afterOutcome(transaction, previousStatus, wallet, entry, context);
+  }
+
+  /** Leva uma transação PENDING_REFERENCE já gravada a FAILED com PROCESSING_ERROR. Mesmas exigências de `process`. */
+  async fail(transaction: WagerTransaction, origin: EventOrigin): Promise<void> {
+    const previousStatus = transaction.status;
+    transaction.fail(FailureCode.ProcessingError);
+    await this.deps.wagerTransactions.update(transaction);
+    await this.afterOutcome(transaction, previousStatus, undefined, undefined, origin);
+  }
+
+  private async afterOutcome(
+    transaction: WagerTransaction,
+    previousStatus: WagerTransactionStatus,
+    wallet: Wallet | undefined,
+    entry: WalletLedgerEntry | undefined,
+    origin: EventOrigin,
+  ): Promise<void> {
+    await this.enqueueEvents(transaction, previousStatus, wallet, entry, origin);
+    if (transaction.isTerminal()) {
+      await this.deps.wagerTransactions.scheduleReferenceChecksFor(transaction, origin.now);
+    }
   }
 
   /** Aplica as regras de negócio na ordem: wallet, referência, reversão única, saldo. Retorna o lançamento, se houver. */
@@ -90,12 +123,12 @@ export class WagerTransactionProcessor {
         transaction.referenceExternalTransactionId,
       );
       if (reference === undefined) {
-        context.onMissingReference(transaction);
+        context.onMissingReference(transaction, { reference: undefined, observedBalance });
         return undefined;
       }
       const failure = transaction.checkReference(reference);
       if (failure === FailureCode.ReferenceNotProcessed && reference.status === WagerTransactionStatus.PendingReference) {
-        context.onMissingReference(transaction);
+        context.onMissingReference(transaction, { reference, observedBalance });
         return undefined;
       }
       if (failure !== undefined) {
@@ -137,13 +170,13 @@ export class WagerTransactionProcessor {
     previousStatus: WagerTransactionStatus,
     wallet: Wallet | undefined,
     entry: WalletLedgerEntry | undefined,
-    context: ProcessingContext,
+    origin: EventOrigin,
   ): Promise<void> {
     const eventContext = (): EventContext => ({
       eventId: this.deps.ids.next(),
-      correlationId: context.correlationId,
-      causationId: context.causationId,
-      occurredAt: context.now,
+      correlationId: origin.correlationId,
+      causationId: origin.causationId,
+      occurredAt: origin.now,
     });
     const enqueue = (event: Parameters<typeof OutboxMessage.enqueue>[0]) =>
       this.deps.outbox.insert(OutboxMessage.enqueue(event));
@@ -157,6 +190,9 @@ export class WagerTransactionProcessor {
         return;
       case WagerTransactionStatus.Rejected:
         await enqueue(WagerTransactionRejected.from(transaction, eventContext()));
+        return;
+      case WagerTransactionStatus.Failed:
+        await enqueue(WagerTransactionFailed.from(transaction, eventContext()));
         return;
       case WagerTransactionStatus.PendingReference:
         if (previousStatus !== WagerTransactionStatus.PendingReference) {

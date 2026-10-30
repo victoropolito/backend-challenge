@@ -25,6 +25,15 @@ export abstract class WagerTransactionRepository {
   /** Indica se a transação já foi revertida por um REFUND ou ROLLBACK processado. */
   abstract hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
 
+  /** Transações PENDING_REFERENCE com verificação vencida, da mais atrasada para a mais recente. Sem trava. */
+  abstract findDueReferenceChecks(now: Date, limit: number): Promise<WagerTransaction[]>;
+
+  /**
+   * Antecipa para `at` a próxima verificação das transações PENDING_REFERENCE da mesma wallet que esperam por
+   * `reference`. Retorna quantas foram reagendadas.
+   */
+  abstract scheduleReferenceChecksFor(reference: WagerTransaction, at: Date): Promise<number>;
+
   /** Lança DuplicateWagerTransactionError em conflito de external id, idempotency key ou reversão já processada. */
   abstract insert(transaction: WagerTransaction): Promise<void>;
 

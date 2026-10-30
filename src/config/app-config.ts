@@ -29,6 +29,11 @@ const EnvSchema = z.object({
   OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(10),
   OUTBOX_IDLE_DELAY_MS: z.coerce.number().int().min(10).default(500),
   OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(100).default(5_000),
+
+  REFERENCE_WORKER_ENABLED: z.stringbool().default(true),
+  REFERENCE_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(20),
+  REFERENCE_WORKER_IDLE_DELAY_MS: z.coerce.number().int().min(10).default(1_000),
+  REFERENCE_CHECK_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(15),
 });
 
 export interface AppConfig {
@@ -62,6 +67,12 @@ export interface AppConfig {
     readonly batchSize: number;
     readonly idleDelayMs: number;
     readonly publishTimeoutMs: number;
+  };
+  readonly referenceWorker: {
+    readonly enabled: boolean;
+    readonly batchSize: number;
+    readonly idleDelayMs: number;
+    readonly maxAttempts: number;
   };
 }
 
@@ -116,6 +127,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       batchSize: e.OUTBOX_BATCH_SIZE,
       idleDelayMs: e.OUTBOX_IDLE_DELAY_MS,
       publishTimeoutMs: e.OUTBOX_PUBLISH_TIMEOUT_MS,
+    },
+    referenceWorker: {
+      enabled: e.REFERENCE_WORKER_ENABLED,
+      batchSize: e.REFERENCE_WORKER_BATCH_SIZE,
+      idleDelayMs: e.REFERENCE_WORKER_IDLE_DELAY_MS,
+      maxAttempts: e.REFERENCE_CHECK_MAX_ATTEMPTS,
     },
   };
 }

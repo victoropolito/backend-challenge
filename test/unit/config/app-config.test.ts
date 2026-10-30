@@ -14,6 +14,7 @@ describe('loadConfig', () => {
     expect(config.sqs.wagerDlqName).toBe('wager-transactions-dlq.fifo');
     expect(config.sqs.eventsQueueName).toBe('wagering-events.fifo');
     expect(config.outbox).toEqual({ enabled: true, batchSize: 10, idleDelayMs: 500, publishTimeoutMs: 5_000 });
+    expect(config.referenceWorker).toEqual({ enabled: true, batchSize: 20, idleDelayMs: 1_000, maxAttempts: 15 });
     expect(config.aws.credentials).toBeUndefined();
   });
 
@@ -53,5 +54,8 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...validEnv, SQS_CONSUMER_WAIT_TIME_SECONDS: '21' })).toThrow(InvalidConfigError);
     expect(loadConfig({ ...validEnv, OUTBOX_PUBLISHER_ENABLED: 'false' }).outbox.enabled).toBe(false);
     expect(() => loadConfig({ ...validEnv, OUTBOX_BATCH_SIZE: '0' })).toThrow(InvalidConfigError);
+    expect(loadConfig({ ...validEnv, REFERENCE_WORKER_ENABLED: 'false' }).referenceWorker.enabled).toBe(false);
+    expect(loadConfig({ ...validEnv, REFERENCE_CHECK_MAX_ATTEMPTS: '3' }).referenceWorker.maxAttempts).toBe(3);
+    expect(() => loadConfig({ ...validEnv, REFERENCE_CHECK_MAX_ATTEMPTS: '0' })).toThrow(InvalidConfigError);
   });
 });

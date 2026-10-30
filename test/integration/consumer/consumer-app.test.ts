@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
 import { createHttpApp } from '../../../src/http/create-http-app';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
+
+setDefaultTimeout(30_000);
 
 const ENV_KEYS = [
   'DATABASE_URL',
@@ -12,6 +14,7 @@ const ENV_KEYS = [
   'SQS_EVENTS_QUEUE_NAME',
   'SQS_CONSUMER_ENABLED',
   'SQS_CONSUMER_WAIT_TIME_SECONDS',
+  'REFERENCE_WORKER_IDLE_DELAY_MS',
 ] as const;
 
 let db: TestDatabase;
@@ -29,6 +32,7 @@ beforeAll(async () => {
     SQS_EVENTS_QUEUE_NAME: queues.eventsQueueName,
     SQS_CONSUMER_ENABLED: 'true',
     SQS_CONSUMER_WAIT_TIME_SECONDS: '1',
+    REFERENCE_WORKER_IDLE_DELAY_MS: '100',
   });
   app = await createHttpApp({ logger: false });
   await app.listen(0);
@@ -47,51 +51,82 @@ afterAll(async () => {
   await db?.drop();
 });
 
+const baseUrl = async () => (await app!.getUrl()).replace('[::1]', 'localhost');
+
+const openWallet = async () => {
+  const created = await fetch(`${await baseUrl()}/wallets`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ playerId: randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' } }),
+  });
+  return (await created.json()) as { id: string; playerId: string };
+};
+
+const sendTransaction = (
+  wallet: { id: string; playerId: string },
+  data: { externalTransactionId: string; kind: string; amount: string; referenceExternalTransactionId?: string },
+) =>
+  queues.send(
+    {
+      messageId: randomUUID(),
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-a',
+        externalTransactionId: data.externalTransactionId,
+        idempotencyKey: `provider-a:${data.externalTransactionId}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: 'round-1',
+        gameId: 'fortune-chimp',
+        kind: data.kind,
+        money: { amount: data.amount, currency: 'BRL' },
+        referenceExternalTransactionId: data.referenceExternalTransactionId ?? null,
+      },
+    },
+    wallet.id,
+  );
+
+const transactionOf = async (externalTransactionId: string) =>
+  (await fetch(`${await baseUrl()}/providers/provider-a/wagering/transactions/${externalTransactionId}`)).json() as Promise<{
+    status: string;
+    balance: { amount: string } | null;
+  }>;
+
 describe('consumer and outbox publisher in the application', () => {
+  it('a WIN received before its BET waits and is applied by the pending reference worker once the BET arrives', async () => {
+    const wallet = await openWallet();
+    const betId = randomUUID();
+    const winId = randomUUID();
+
+    await sendTransaction(wallet, { externalTransactionId: winId, kind: 'WIN', amount: '40.00', referenceExternalTransactionId: betId });
+    await eventually(async () => expect((await transactionOf(winId)).status).toBe('PENDING_REFERENCE'));
+    await sendTransaction(wallet, { externalTransactionId: betId, kind: 'BET', amount: '25.00' });
+
+    await eventually(async () => expect(await transactionOf(winId)).toMatchObject({ status: 'PROCESSED', balance: { amount: '115.00' } }));
+    expect(await transactionOf(betId)).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00' } });
+  });
+
   it('consumes the configured queue with the same use case as the API, publishes the events, and stops on close', async () => {
-    const baseUrl = (await app!.getUrl()).replace('[::1]', 'localhost');
-    const created = await fetch(`${baseUrl}/wallets`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ playerId: randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' } }),
-    });
-    const wallet = (await created.json()) as { id: string; playerId: string };
+    const wallet = await openWallet();
     const externalTransactionId = randomUUID();
 
-    await queues.send(
-      {
-        messageId: randomUUID(),
-        type: 'WagerTransactionRequested',
-        occurredAt: new Date().toISOString(),
-        data: {
-          providerId: 'provider-a',
-          externalTransactionId,
-          idempotencyKey: `provider-a:${externalTransactionId}`,
-          playerId: wallet.playerId,
-          walletId: wallet.id,
-          roundId: 'round-1',
-          gameId: 'fortune-chimp',
-          kind: 'BET',
-          money: { amount: '25.00', currency: 'BRL' },
-        },
-      },
-      wallet.id,
-    );
+    await sendTransaction(wallet, { externalTransactionId, kind: 'BET', amount: '25.00' });
 
-    await eventually(async () => {
-      const response = await fetch(`${baseUrl}/providers/provider-a/wagering/transactions/${externalTransactionId}`);
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00', currency: 'BRL' } });
-    });
+    await eventually(async () =>
+      expect(await transactionOf(externalTransactionId)).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00' } }),
+    );
     await eventually(async () => expect(await queues.countMain()).toBe(0));
 
-    const events: { eventType: string; data: { externalTransactionId?: string } }[] = [];
+    const events: { eventType: string; data: { externalTransactionId?: string; walletId?: string } }[] = [];
     await eventually(async () => {
       events.push(...(await queues.drainEvents()).map((item) => JSON.parse(item.Body!)));
       expect(
         events.filter((event) => event.data.externalTransactionId === externalTransactionId).map((event) => event.eventType),
       ).toEqual(['WagerTransactionProcessed']);
-      expect(events.filter((event) => event.eventType === 'WalletBalanceChanged')).toHaveLength(2);
+      expect(
+        events.filter((event) => event.eventType === 'WalletBalanceChanged' && event.data.walletId === wallet.id),
+      ).toHaveLength(2);
     });
 
     const closing = Date.now();
