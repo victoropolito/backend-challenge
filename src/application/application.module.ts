@@ -85,7 +85,7 @@ const PROCESSOR: Provider = {
   ) => new WagerTransactionProcessor({ wallets, ledger, wagerTransactions, outbox, ids }),
 };
 
-/** Casos de uso e consultas da aplicação, com relógio e gerador de ids do sistema. */
+/** Casos de uso e consultas da aplicação, com relógio e gerador de ids do sistema (o relógio é exportado para os adaptadores). */
 @Module({
   providers: [
     { provide: Clock, useClass: SystemClock },
@@ -94,6 +94,6 @@ const PROCESSOR: Provider = {
     ...USE_CASES,
     ...QUERIES,
   ],
-  exports: [PROCESSOR, ...USE_CASES, ...QUERIES],
+  exports: [Clock, PROCESSOR, ...USE_CASES, ...QUERIES],
 })
 export class ApplicationModule {}

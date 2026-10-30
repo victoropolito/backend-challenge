@@ -8,10 +8,12 @@ let db: TestDatabase;
 let app: INestApplication;
 let baseUrl: string;
 const originalDatabaseUrl = process.env.DATABASE_URL;
+const originalConsumerEnabled = process.env.SQS_CONSUMER_ENABLED;
 
 beforeAll(async () => {
   db = await createTestDatabase();
   process.env.DATABASE_URL = db.url;
+  process.env.SQS_CONSUMER_ENABLED = 'false';
   app = await createHttpApp({ logger: false });
   await app.listen(0);
   baseUrl = (await app.getUrl()).replace('[::1]', 'localhost');
@@ -20,6 +22,11 @@ beforeAll(async () => {
 afterAll(async () => {
   await app?.close();
   process.env.DATABASE_URL = originalDatabaseUrl;
+  if (originalConsumerEnabled === undefined) {
+    delete process.env.SQS_CONSUMER_ENABLED;
+  } else {
+    process.env.SQS_CONSUMER_ENABLED = originalConsumerEnabled;
+  }
   await db?.drop();
 });
 

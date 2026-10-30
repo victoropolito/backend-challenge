@@ -1,6 +1,6 @@
 # Arquitetura — Distributed Wagering Processor
 
-Este documento registra as decisões técnicas, os trade-offs e as limitações conhecidas da solução. Ele é atualizado a cada etapa; seções marcadas como **planejado** descrevem o desenho adotado para partes ainda não implementadas.
+Este documento registra as decisões técnicas, os trade-offs e as limitações conhecidas da solução. Como subir o ambiente, rodar e validar manualmente (inclusive o shutdown com `SIGTERM` real) está em [`docs/execucao-e-validacao.md`](docs/execucao-e-validacao.md). Ele é atualizado a cada etapa; seções marcadas como **planejado** descrevem o desenho adotado para partes ainda não implementadas.
 
 ## 1. Visão geral
 
@@ -19,7 +19,7 @@ src/
 │   └── system/             relógio do sistema e gerador de UUIDv7
 ├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
 ├── http/                   controllers, validação (Zod), correlation id, filtro de erros
-├── consumer/               leitura das mensagens da fila e classificação de falhas
+├── consumer/               consumidor SQS: leitura das mensagens, classificação de falhas, loop, DLQ, shutdown
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
@@ -259,9 +259,24 @@ O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O 
 
 **`FAILED`/`PROCESSING_ERROR` não é produzido pelo consumidor.** Uma falha que esgota as tentativas não tem estado confirmado para anotar, porque a transação SQL foi desfeita por inteiro. Gravar `FAILED` ainda exigiria o banco, que pode ser justamente o que está fora. O registro da falha é a mensagem na DLQ, e reprocessá-la (redrive) é seguro pela idempotência. O status continua no modelo, reservado para falhas permanentes de transações já gravadas (worker de `PENDING_REFERENCE`).
 
-### 8.4 Loop de consumo (**planejado**)
+### 8.4 Loop de consumo
 
-Long polling na fila FIFO; mensagens do mesmo `MessageGroupId` processadas em ordem e grupos diferentes em paralelo; `DeleteMessage` só depois do commit; nova tentativa via `ChangeMessageVisibility` com backoff calculado pelo `ApproximateReceiveCount`; envio explícito à DLQ (falha permanente ou limite esgotado), com o motivo em atributos da mensagem; `RedrivePolicy` com `maxReceiveCount = 5` como rede de segurança; shutdown gracioso (para de receber, conclui as mensagens em andamento e devolve a visibilidade das que não começaram).
+`SqsWagerTransactionConsumer`, ligado ao ciclo de vida do NestJS por `ConsumerModule`:
+
+- **Recebimento:** long polling (`WaitTimeSeconds`, padrão 10 s), lotes de até 10 mensagens, `VisibilityTimeout` de 30 s, pedindo `ApproximateReceiveCount` e `MessageGroupId`. Uma falha ao receber (SQS fora) é registrada, e o loop tenta de novo após 1 s, sem derrubar a aplicação.
+- **Ordem:** as mensagens do lote são agrupadas por `MessageGroupId`. Grupos diferentes rodam em paralelo; dentro de um grupo, as mensagens são processadas uma a uma, na ordem da fila. O produtor deve usar o `walletId` como grupo, o que dá ordem por wallet e paralelismo entre wallets. A correção não depende dessa ordem, porque o lock da wallet e o `PENDING_REFERENCE` cobrem chegadas fora de ordem.
+- **Ack:** `DeleteMessage` só depois que o caso de uso retornou, ou seja, depois do commit. Se o processo morrer entre o commit e o ack, a mensagem volta e é confirmada como duplicata pela inbox, sem efeito.
+- **Nova tentativa:** a falha transitória não confirma a mensagem. A visibilidade é trocada para o backoff da tentativa (`ApproximateReceiveCount`): 1 s, 2 s, 4 s… até 60 s. As mensagens seguintes do mesmo grupo no lote são devolvidas sem processar, para não passarem na frente.
+- **DLQ:** em falha permanente, ou transitória na última tentativa (`SQS_CONSUMER_MAX_ATTEMPTS`, padrão 5), a mensagem é **enviada explicitamente** à DLQ e então apagada da fila principal. Ela leva o corpo original, o mesmo `MessageGroupId`, `MessageDeduplicationId` = `MessageId` de origem e atributos `failureKind`, `failureCode`, `failureMessage`, `sourceMessageId` e `receiveCount`. O envio explícito registra o motivo; a `RedrivePolicy` da fila (`maxReceiveCount = 5`) continua como rede de segurança para mensagens que derrubam o processo antes de qualquer decisão. O limite da aplicação não deve passar do `maxReceiveCount`.
+- **Falha do próprio SQS ao confirmar, repetir ou mandar à DLQ:** é registrada e ignorada. A mensagem volta quando a visibilidade expira e é reprocessada com segurança, pela inbox e pela idempotência.
+- **Shutdown gracioso** (`beforeApplicationShutdown`, antes de o banco e o cliente SQS fecharem):
+  1. o consumidor para de pedir mensagens; o long polling em curso termina normalmente, porque abortá-lo poderia deixar mensagens recebidas, e não entregues, invisíveis até o timeout;
+  2. as mensagens já recebidas que ainda não começaram são devolvidas com visibilidade 0;
+  3. as que estão em processamento são concluídas e confirmadas;
+  4. se passar de `SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS` (padrão 20 s), as que restarem são devolvidas, e o resultado delas não é mais confirmado pela instância que está saindo. Se o commit acontecer mesmo assim, a próxima entrega vira duplicata.
+- **Em container**, a aplicação precisa de um init como PID 1 (`docker run --init`, tini). Ao fim dos hooks, o NestJS re-emite o sinal recebido para encerrar o processo, e o PID 1 ignora sinais sem handler: sem init, o processo só termina quando o event loop esvazia.
+- **Configuração:** `SQS_CONSUMER_ENABLED`, `SQS_CONSUMER_WAIT_TIME_SECONDS`, `SQS_CONSUMER_BATCH_SIZE`, `SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS`, `SQS_CONSUMER_MAX_ATTEMPTS`, `SQS_CONSUMER_RETRY_BASE_DELAY_MS`, `SQS_CONSUMER_RETRY_MAX_DELAY_MS`, `SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS`.
+- No boot, as URLs das filas são resolvidas pelo nome. Se o SQS ainda não estiver acessível, o módulo tenta de novo a cada 2 s, sem impedir a API de subir.
 
 ## 9. Interpretações adotadas
 
@@ -280,6 +295,9 @@ Long polling na fila FIFO; mensagens do mesmo `MessageGroupId` processadas em or
 
 ## 10. Limitações conhecidas
 
+- O consumidor não estende a visibilidade durante o processamento (sem *heartbeat*): uma mensagem que demore mais que o `VisibilityTimeout` (30 s) pode ser entregue a outra instância ao mesmo tempo. Isso é seguro (inbox, lock e idempotência), mas gasta trabalho; o processamento normal leva milissegundos.
+- Cada instância tem um único loop de recebimento: o próximo lote só é pedido depois que o anterior termina. O paralelismo vem dos grupos dentro do lote e do número de instâncias.
+- Devolver a visibilidade no shutdown conta como uma entrega a mais (`ApproximateReceiveCount`), e reinícios seguidos podem aproximar uma mensagem do limite da DLQ.
 - Depois de `BET` → `REFUND` → `ROLLBACK` do `REFUND`, a `BET` não pode ser revertida de novo (o índice de reversão única continua vendo o `REFUND` processado). É um caso raro e o comportamento é conservador.
 - `WalletBalanceChanged.from` identifica o lançamento mais recente comparando o saldo final com o saldo atual; um lançamento antigo com o mesmo saldo final passaria. O risco é baixo, porque o evento é criado logo após o movimento.
 - A imutabilidade do ledger é garantida por trigger, que vale para qualquer role. Restringir permissões por role no banco (aplicação sem `UPDATE`/`DELETE`) ficou de fora, porque o ambiente local usa um único usuário.
@@ -292,8 +310,10 @@ Long polling na fila FIFO; mensagens do mesmo `MessageGroupId` processadas em or
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
 - **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
 - **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP. O consumo de mensagens é testado no banco real: inbox gravada com o desfecho, redelivery como duplicata, mesmo `messageId` com outro conteúdo, reenvio com outro `messageId` como replay, rejeição e `PENDING_REFERENCE` registrados, conflito sem inbox, rollback da inbox junto com transação, ledger e eventos (falha injetada na outbox), a mesma mensagem 20 vezes em paralelo e 50 mensagens diferentes para a mesma transação em paralelo (um único débito).
-- Nenhum mock de banco. **Planejado:** LocalStack nos testes de mensageria, testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
+- **Consumidor SQS no LocalStack real** (filas FIFO e DLQ descartáveis por teste, com a mesma `RedrivePolicy`): aplicação e confirmação após o commit, rejeição de negócio confirmada sem retry, redelivery e reenvio aplicados uma vez, mensagem já commitada antes de um "crash" confirmada sem reaplicar, mensagem malformada e conflito de idempotência direto para a DLQ com os atributos de falha, falha transitória repetida com backoff até dar certo, tentativas esgotadas indo para a DLQ, ordem dentro do grupo com grupos em paralelo, shutdown que espera a mensagem em andamento e para de receber, e timeout de shutdown que devolve a visibilidade (outra instância processa logo, sem esperar os 30 s). Mais um teste sobe a aplicação Nest real com o consumidor ligado pela config e o para no `close()`. Mutações conferidas: sem devolver a visibilidade e sem ordem por grupo, os testes falham.
+- **Shutdown com `SIGTERM` real** (`scripts/sigterm-check.sh`, manual): a aplicação num container Linux recebe `docker stop` no meio de uma rajada de mensagens; o script confere transações = ledger = inbox e saldos corretos logo depois do sinal e, após o restart, que tudo foi aplicado exatamente uma vez. Ver `docs/execucao-e-validacao.md` §7.
+- Nenhum mock de banco nem de fila. **Planejado:** testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
 ## 12. Pendências
 
-Loop do consumidor SQS (ack, retry, DLQ, shutdown gracioso; seção 8.4); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

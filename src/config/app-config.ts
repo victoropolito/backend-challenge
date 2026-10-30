@@ -14,6 +14,15 @@ const EnvSchema = z.object({
 
   SQS_WAGER_QUEUE_NAME: z.string().endsWith('.fifo').default('wager-transactions.fifo'),
   SQS_WAGER_DLQ_NAME: z.string().endsWith('.fifo').default('wager-transactions-dlq.fifo'),
+
+  SQS_CONSUMER_ENABLED: z.stringbool().default(true),
+  SQS_CONSUMER_WAIT_TIME_SECONDS: z.coerce.number().int().min(0).max(20).default(10),
+  SQS_CONSUMER_BATCH_SIZE: z.coerce.number().int().min(1).max(10).default(10),
+  SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(43_200).default(30),
+  SQS_CONSUMER_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(5),
+  SQS_CONSUMER_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(0).default(1_000),
+  SQS_CONSUMER_RETRY_MAX_DELAY_MS: z.coerce.number().int().min(0).max(43_200_000).default(60_000),
+  SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(20_000),
 });
 
 export interface AppConfig {
@@ -31,6 +40,15 @@ export interface AppConfig {
   readonly sqs: {
     readonly wagerQueueName: string;
     readonly wagerDlqName: string;
+  };
+  readonly consumer: {
+    readonly enabled: boolean;
+    readonly waitTimeSeconds: number;
+    readonly batchSize: number;
+    readonly visibilityTimeoutSeconds: number;
+    readonly maxAttempts: number;
+    readonly retryPolicy: { readonly baseDelayMs: number; readonly maxDelayMs: number };
+    readonly shutdownTimeoutMs: number;
   };
 }
 
@@ -67,5 +85,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         : undefined,
     },
     sqs: { wagerQueueName: e.SQS_WAGER_QUEUE_NAME, wagerDlqName: e.SQS_WAGER_DLQ_NAME },
+    consumer: {
+      enabled: e.SQS_CONSUMER_ENABLED,
+      waitTimeSeconds: e.SQS_CONSUMER_WAIT_TIME_SECONDS,
+      batchSize: e.SQS_CONSUMER_BATCH_SIZE,
+      visibilityTimeoutSeconds: e.SQS_CONSUMER_VISIBILITY_TIMEOUT_SECONDS,
+      maxAttempts: e.SQS_CONSUMER_MAX_ATTEMPTS,
+      retryPolicy: { baseDelayMs: e.SQS_CONSUMER_RETRY_BASE_DELAY_MS, maxDelayMs: e.SQS_CONSUMER_RETRY_MAX_DELAY_MS },
+      shutdownTimeoutMs: e.SQS_CONSUMER_SHUTDOWN_TIMEOUT_MS,
+    },
   };
 }

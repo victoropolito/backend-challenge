@@ -31,4 +31,23 @@ describe('loadConfig', () => {
       loadConfig({ ...validEnv, AWS_ACCESS_KEY_ID: 'test', AWS_SECRET_ACCESS_KEY: 'test' }).aws.credentials,
     ).toEqual({ accessKeyId: 'test', secretAccessKey: 'test' });
   });
+
+  it('applies the consumer defaults', () => {
+    expect(loadConfig(validEnv).consumer).toEqual({
+      enabled: true,
+      waitTimeSeconds: 10,
+      batchSize: 10,
+      visibilityTimeoutSeconds: 30,
+      maxAttempts: 5,
+      retryPolicy: { baseDelayMs: 1_000, maxDelayMs: 60_000 },
+      shutdownTimeoutMs: 20_000,
+    });
+  });
+
+  it('reads the consumer switch and limits', () => {
+    expect(loadConfig({ ...validEnv, SQS_CONSUMER_ENABLED: 'false' }).consumer.enabled).toBe(false);
+    expect(() => loadConfig({ ...validEnv, SQS_CONSUMER_ENABLED: 'maybe' })).toThrow(InvalidConfigError);
+    expect(() => loadConfig({ ...validEnv, SQS_CONSUMER_BATCH_SIZE: '11' })).toThrow(InvalidConfigError);
+    expect(() => loadConfig({ ...validEnv, SQS_CONSUMER_WAIT_TIME_SECONDS: '21' })).toThrow(InvalidConfigError);
+  });
 });
