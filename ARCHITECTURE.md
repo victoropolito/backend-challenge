@@ -17,6 +17,7 @@ src/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
 │   ├── messaging/          cliente SQS
 │   └── system/             relógio do sistema e gerador de UUIDv7
+├── http/                   controllers, validação (Zod), correlation id, filtro de erros
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
@@ -183,7 +184,51 @@ A unidade de concorrência é a wallet.
 - **Conflitos:** mesma chave com outro hash → `IdempotencyConflictError` (`IDEMPOTENCY_CONFLICT`). `externalTransactionId` já usado sob outra chave → `ExternalTransactionIdConflictError` (`EXTERNAL_TRANSACTION_ID_CONFLICT`): a chave é a fonte da verdade, então chave nova com id antigo não é tratada como replay.
 - Nenhuma idempotência depende de memória: as consultas e a unicidade estão no PostgreSQL.
 
-## 7. Interpretações adotadas
+## 7. API HTTP
+
+### 7.1 Status HTTP
+
+O provider decide o que fazer **só pelo status**, sem interpretar mensagens. O mapeamento é o mesmo em todos os endpoints:
+
+| Situação | Status | `code` | O provider pode reenviar? |
+|---|---|---|---|
+| Transação aplicada | 200 | — | já aplicada (reenvio = replay) |
+| Wallet criada | 201 | — | — |
+| Referência ausente, processamento adiado (`PENDING_REFERENCE`) | 202 | — | não precisa; acompanhar pelo GET ou pelos eventos |
+| Payload inválido (formato, tipo, campo ausente, valor com mais de 2 casas, regra de formato do domínio) | 400 | `VALIDATION_ERROR`, `INVALID_MONEY`, `INVALID_WAGER_TRANSACTION`, `INVALID_WALLET_OPERATION`, `INVALID_CURSOR`, `MALFORMED_REQUEST` | só depois de corrigir |
+| Recurso inexistente | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `NOT_FOUND` | — |
+| Conflito: wallet duplicada, idempotency key com outro payload, `externalTransactionId` sob outra chave | 409 | `WALLET_ALREADY_EXISTS`, `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT` | não com a mesma chave |
+| Rejeição por regra de negócio (transação gravada como `REJECTED`) | 422 | corpo traz o `failureCode` | não; ver ação na seção 3.4 |
+| Falha transitória de infraestrutura (conexão, deadlock, lock timeout) | 503 + `Retry-After` | `SERVICE_UNAVAILABLE`, `WALLET_CONCURRENT_MODIFICATION` | **sim**, com a mesma chave |
+| Erro inesperado (bug) | 500 | `INTERNAL_ERROR` | sim; a submissão é atômica e idempotente |
+
+- **O replay devolve o mesmo status e o mesmo corpo da primeira resposta**, mudando só `idempotentReplay` para `true`: 200 para aplicada, 422 para rejeitada, 202 para pendente (com o estado atual dela).
+- Uma rejeição de negócio é **resposta**, não erro: a transação existe, tem id e é consultável. Por isso o corpo do 422 é o mesmo formato da submissão (`transactionId`, `status`, `failureCode`, `balance`, `idempotentReplay`), e não o formato de erro.
+- 503 só é usado quando é seguro repetir: a transação SQL foi desfeita por inteiro, e a idempotência garante que um reenvio que encontre a operação já aplicada vira replay.
+- Códigos de domínio que não estão na tabela (ex.: `INVALID_TRANSACTION_STATE`) indicam bug e viram 500 sem expor a mensagem interna.
+
+### 7.2 Formato
+
+- **Erro:** `{ code, message, retryable, details?, correlationId }`. Em `VALIDATION_ERROR`, `details` lista `{ path, message }` com o caminho do campo (`body.money.amount`, `headers.idempotency-key`, `query.limit`). Rotas inexistentes e JSON malformado usam o mesmo formato.
+- **Submissão:** `{ transactionId, status, failureCode, balance, idempotentReplay }`. `balance` é o saldo observado da transação (`null` quando não há).
+- **Consultas** devolvem a transação completa (incluindo referência resolvida, tentativas de referência, `processedAt`) e a wallet com `id`, `playerId`, `balance`, `version`, `createdAt`, `updatedAt`. Valores monetários sempre como `{ amount: "0.00", currency }`.
+- `GET /health/ready` mantém o próprio corpo (`{ status, checks }`), com 503 quando alguma dependência está fora.
+
+### 7.3 Validação
+
+- Toda entrada (body, params, query, headers) passa por um schema **Zod** antes de chegar ao caso de uso. Todos os ids (provider, external id, player, rodada, jogo, referência, `Idempotency-Key`, `walletId`, `transactionId`) passam por `trim` antes de qualquer outra regra: o valor aparado é o que entra no hash, é gravado e é usado nas consultas, então `" abc "` e `"abc"` são o mesmo id (e o reenvio de um vira replay do outro). Depois do `trim`, ids de texto têm de 1 a 255 caracteres; `walletId` e `transactionId` precisam ser UUID. `kind` aceita só `BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK` (`OPENING` é interno). `amount` precisa ser string: número JSON é recusado, porque já chegaria arredondado por ponto flutuante.
+- Campos desconhecidos no body são ignorados: não entram no hash nem são persistidos.
+- `Idempotency-Key` é obrigatório (1 a 255 caracteres). O formato recomendado `{providerId}:{externalTransactionId}` não é imposto.
+
+### 7.4 Correlation id
+
+`X-Correlation-Id` recebido é adotado se tiver até 128 caracteres de `[A-Za-z0-9._:-]`; senão um UUIDv7 é gerado. Ele volta no header da resposta, no corpo de erro e vai para o `correlationId` de todos os eventos gerados pela requisição.
+
+### 7.5 Paginação do ledger
+
+`GET /wallets/:walletId/ledger?cursor=&limit=` devolve `{ items, nextCursor }` em ordem de gravação (`sequence`), `limit` padrão 50 e máximo 200. O cursor é opaco (base64url de `{ wallet, posição }`) e **estável**: o ledger é append-only, então páginas já lidas nunca mudam e lançamentos novos aparecem no fim. Um cursor de outra wallet ou adulterado é recusado (`INVALID_CURSOR`). `nextCursor = null` indica a última página.
+
+## 8. Interpretações adotadas
 
 | Tema | Interpretação | Motivo |
 |---|---|---|
@@ -198,7 +243,7 @@ A unidade de concorrência é a wallet.
 | Mesmo `externalTransactionId` com outra idempotency key | Conflito, não replay | O header é a fonte da verdade da idempotência |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
 
-## 8. Limitações conhecidas
+## 9. Limitações conhecidas
 
 - Depois de `BET` → `REFUND` → `ROLLBACK` do `REFUND`, a `BET` não pode ser revertida de novo (o índice de reversão única continua vendo o `REFUND` processado). É um caso raro e o comportamento é conservador.
 - `WalletBalanceChanged.from` identifica o lançamento mais recente comparando o saldo final com o saldo atual; um lançamento antigo com o mesmo saldo final passaria. O risco é baixo, porque o evento é criado logo após o movimento.
@@ -207,12 +252,13 @@ A unidade de concorrência é a wallet.
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
 - O status `FAILED`/`PROCESSING_ERROR` ainda não é produzido: erros de infraestrutura na submissão desfazem a transação SQL e sobem como erro transitório (o cliente pode repetir com segurança). O uso de `FAILED` será definido junto com o consumer SQS (falha permanente depois da DLQ).
 
-## 9. Testes
+## 10. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
-- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma).
+- **Unitários da API:** mapeamento de exceções para status e classificação de erros transitórios do banco.
+- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco (todas as regras de negócio, idempotência e concorrência real; ver seção 5), montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma). A API é testada com a aplicação Nest real (HTTP de verdade, `fetch`) sobre um banco descartável: status e corpo de cada situação da seção 7.1, replay com o mesmo status, paginação completa do ledger, cursor inválido, JSON malformado, correlation id chegando aos eventos e o cenário 100/80/80 por HTTP.
 - Nenhum mock de banco. **Planejado:** LocalStack nos testes de mensageria, testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
-## 10. Pendências
+## 11. Pendências
 
-Endpoints HTTP (os casos de uso de criação de wallet e de submissão já existem); consumer SQS (inbox, retry, DLQ, shutdown gracioso); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Consumer SQS (inbox, retry, DLQ, shutdown gracioso); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

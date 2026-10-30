@@ -38,9 +38,18 @@ export abstract class WalletRepository {
   abstract update(wallet: Wallet, expectedVersion: number): Promise<void>;
 }
 
+export interface LedgerPageItem {
+  entry: WalletLedgerEntry;
+  /** Posição do lançamento na ordem de gravação, crescente e estável; base do cursor de paginação. */
+  position: bigint;
+}
+
 /** Persistência do ledger: somente inserção e leitura. */
 export abstract class LedgerRepository {
   abstract insert(entry: WalletLedgerEntry): Promise<void>;
 
   abstract findByTransactionId(transactionId: string): Promise<WalletLedgerEntry[]>;
+
+  /** Até `limit` lançamentos da wallet em ordem de gravação, começando depois de `after` (exclusivo). */
+  abstract findPageByWallet(walletId: string, after: bigint | undefined, limit: number): Promise<LedgerPageItem[]>;
 }

@@ -7,6 +7,7 @@ import {
   WalletAlreadyExistsError,
   WalletConcurrentModificationError,
   WalletRepository,
+  type LedgerPageItem,
 } from '../../../domain/wallet/wallet-repository';
 import { LedgerDirection, WalletLedgerEntry } from '../../../domain/wallet/wallet-ledger-entry';
 import { WalletSchema, type WalletRecord } from '../records/wallet.record';
@@ -73,6 +74,15 @@ export class MikroOrmLedgerRepository extends LedgerRepository {
       { orderBy: { sequence: 'asc' }, disableIdentityMap: true },
     );
     return records.map(toLedgerEntry);
+  }
+
+  async findPageByWallet(walletId: string, after: bigint | undefined, limit: number): Promise<LedgerPageItem[]> {
+    const records = await this.em.find(
+      WalletLedgerEntrySchema,
+      after === undefined ? { walletId } : { walletId, sequence: { $gt: after } },
+      { orderBy: { sequence: 'asc' }, limit, disableIdentityMap: true },
+    );
+    return records.map((record) => ({ entry: toLedgerEntry(record), position: BigInt(record.sequence!) }));
   }
 }
 

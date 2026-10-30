@@ -1,7 +1,8 @@
-import { Controller, Get, Inject, ServiceUnavailableException } from '@nestjs/common';
+import { Controller, Get, Inject, Res } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import type { HttpResponse } from '../http/http-types';
 
 type CheckResult = { status: 'up' } | { status: 'down'; reason: string };
 
@@ -22,7 +23,9 @@ export class HealthController {
   }
 
   @Get('ready')
-  async ready(): Promise<{ status: 'ok'; checks: Record<string, CheckResult> }> {
+  async ready(
+    @Res({ passthrough: true }) response: HttpResponse,
+  ): Promise<{ status: 'ok' | 'unavailable'; checks: Record<string, CheckResult> }> {
     const [postgres, sqs] = await Promise.all([
       this.check(async () => {
         await this.orm.em.getConnection().execute('select 1');
@@ -37,7 +40,8 @@ export class HealthController {
 
     const checks = { postgres, sqs };
     if (Object.values(checks).some((c) => c.status === 'down')) {
-      throw new ServiceUnavailableException({ status: 'unavailable', checks });
+      response.status(503);
+      return { status: 'unavailable', checks };
     }
     return { status: 'ok', checks };
   }

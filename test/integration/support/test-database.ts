@@ -8,6 +8,7 @@ export type Execute = <T = Record<string, unknown>>(sql: string, params?: unknow
 export interface TestDatabase {
   readonly orm: MikroORM;
   readonly name: string;
+  readonly url: string;
   /** Executa um statement em autocommit. */
   execute: Execute;
   /** Executa `work` numa única transação SQL; constraints adiadas são verificadas no commit. */
@@ -40,6 +41,7 @@ export async function createTestDatabase(): Promise<TestDatabase> {
   return {
     orm,
     name,
+    url: config.database.url,
     execute: <T>(sql: string, params: unknown[] = []) => orm.em.getConnection().execute(sql, params) as Promise<T[]>,
     transaction: (work) =>
       orm.em.fork().transactional((em) => work(<T>(sql: string, params: unknown[] = []) => em.execute(sql, params) as Promise<T[]>)),

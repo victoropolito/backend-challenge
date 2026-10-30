@@ -14,6 +14,7 @@ import type { WalletRepository } from '../../domain/wallet/wallet-repository';
 import type { Clock } from '../shared/clock';
 import type { IdGenerator } from '../shared/id-generator';
 import type { TransactionRunner } from '../shared/transaction-runner';
+import { isUuid } from '../shared/uuid';
 import { DEFAULT_REFERENCE_CHECK_POLICY } from './reference-check-policy';
 import { wagerPayloadHash } from './wager-payload-hash';
 import type { WagerTransactionProcessor } from './wager-transaction-processor';
@@ -75,8 +76,6 @@ export class ExternalTransactionIdConflictError extends DomainError {
   }
 }
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /**
  * Recebe uma transação de provider: idempotente por (providerId, idempotencyKey), serializada por wallet com lock
  * pessimista, e atômica (transação, lançamento, saldo e eventos na mesma transação SQL).
@@ -88,7 +87,7 @@ export class SubmitWagerTransactionUseCase {
     const { transactions, wallets, processor, clock, ids } = this.deps;
     const now = clock.now();
 
-    if (!UUID.test(command.walletId)) {
+    if (!isUuid(command.walletId)) {
       throw new InvalidWagerTransactionError('walletId must be a UUID');
     }
     const payloadHash = wagerPayloadHash(command);

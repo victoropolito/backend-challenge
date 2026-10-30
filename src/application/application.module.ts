@@ -8,8 +8,10 @@ import { Clock } from './shared/clock';
 import { IdGenerator } from './shared/id-generator';
 import { TransactionRunner } from './shared/transaction-runner';
 import { SubmitWagerTransactionUseCase } from './wagering/submit-wager-transaction.use-case';
+import { WagerTransactionQueries } from './wagering/wager-transaction-queries';
 import { WagerTransactionProcessor } from './wagering/wager-transaction-processor';
 import { CreateWalletUseCase } from './wallet/create-wallet.use-case';
+import { WalletQueries } from './wallet/wallet-queries';
 
 const USE_CASES: Provider[] = [
   {
@@ -39,6 +41,19 @@ const USE_CASES: Provider[] = [
   },
 ];
 
+const QUERIES: Provider[] = [
+  {
+    provide: WalletQueries,
+    inject: [WalletRepository, LedgerRepository],
+    useFactory: (wallets: WalletRepository, ledger: LedgerRepository) => new WalletQueries({ wallets, ledger }),
+  },
+  {
+    provide: WagerTransactionQueries,
+    inject: [WagerTransactionRepository],
+    useFactory: (wagerTransactions: WagerTransactionRepository) => new WagerTransactionQueries(wagerTransactions),
+  },
+];
+
 const PROCESSOR: Provider = {
   provide: WagerTransactionProcessor,
   inject: [WalletRepository, LedgerRepository, WagerTransactionRepository, OutboxRepository, IdGenerator],
@@ -51,14 +66,15 @@ const PROCESSOR: Provider = {
   ) => new WagerTransactionProcessor({ wallets, ledger, wagerTransactions, outbox, ids }),
 };
 
-/** Casos de uso da aplicação, com relógio e gerador de ids do sistema. */
+/** Casos de uso e consultas da aplicação, com relógio e gerador de ids do sistema. */
 @Module({
   providers: [
     { provide: Clock, useClass: SystemClock },
     { provide: IdGenerator, useClass: UuidV7Generator },
     PROCESSOR,
     ...USE_CASES,
+    ...QUERIES,
   ],
-  exports: [PROCESSOR, ...USE_CASES],
+  exports: [PROCESSOR, ...USE_CASES, ...QUERIES],
 })
 export class ApplicationModule {}
