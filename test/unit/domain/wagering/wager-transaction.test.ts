@@ -199,6 +199,10 @@ describe('WagerTransaction', () => {
       expect(transaction.isTerminal()).toBe(true);
     });
 
+    it('does not keep a resolved reference on a transaction without reference', () => {
+      expect(() => pending().reject(FailureCode.InsufficientBalance, 'tx-0')).toThrow(InvalidTransactionStateError);
+    });
+
     it('does not reject with an infrastructure failure code', () => {
       expect(() => pending().reject(FailureCode.ProcessingError)).toThrow(InvalidTransactionStateError);
     });

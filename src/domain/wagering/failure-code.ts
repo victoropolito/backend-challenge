@@ -20,7 +20,7 @@ export enum FailureCode {
   ReferenceNotProcessed = 'REFERENCE_NOT_PROCESSED',
   /** Valor da reversão diferente do valor da referência. */
   ReferenceAmountMismatch = 'REFERENCE_AMOUNT_MISMATCH',
-  /** Referência já revertida por uma operação do mesmo tipo. */
+  /** Referência já revertida por um REFUND ou ROLLBACK processado. */
   ReferenceAlreadyReversed = 'REFERENCE_ALREADY_REVERSED',
   /** Erro permanente de infraestrutura ao processar a transação. */
   ProcessingError = 'PROCESSING_ERROR',

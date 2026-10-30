@@ -3,10 +3,15 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { loadConfig, type AppConfig } from '../../../src/config/app-config';
 import { buildMikroOrmConfig } from '../../../src/infrastructure/database/mikro-orm.config';
 
+export type Execute = <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
+
 export interface TestDatabase {
   readonly orm: MikroORM;
   readonly name: string;
-  execute<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+  /** Executa um statement em autocommit. */
+  execute: Execute;
+  /** Executa `work` numa única transação SQL; constraints adiadas são verificadas no commit. */
+  transaction<T>(work: (execute: Execute) => Promise<T>): Promise<T>;
   drop(): Promise<void>;
 }
 
@@ -36,6 +41,8 @@ export async function createTestDatabase(): Promise<TestDatabase> {
     orm,
     name,
     execute: <T>(sql: string, params: unknown[] = []) => orm.em.getConnection().execute(sql, params) as Promise<T[]>,
+    transaction: (work) =>
+      orm.em.fork().transactional((em) => work(<T>(sql: string, params: unknown[] = []) => em.execute(sql, params) as Promise<T[]>)),
     async drop() {
       await orm.close(true);
       await admin.em.getConnection().execute(`drop database if exists "${name}" with (force)`);

@@ -300,6 +300,9 @@ export class WagerTransaction {
     if (code === FailureCode.ProcessingError) {
       throw new InvalidTransactionStateError(`${code} is not a business rejection`);
     }
+    if (referenceTransactionId !== undefined && this.referenceExternalTransactionId === undefined) {
+      throw new InvalidTransactionStateError(`Transaction ${this.id} has no reference to resolve`);
+    }
     this._status = WagerTransactionStatus.Rejected;
     this._failureCode = code;
     this._referenceTransactionId = referenceTransactionId;

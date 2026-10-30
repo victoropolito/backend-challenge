@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { createTestDatabase, expectViolation, SqlState, type TestDatabase } from '../support/test-database';
+import { createTestDatabase, expectViolation, SqlState, type Execute, type TestDatabase } from '../support/test-database';
 
 type Row = Record<string, unknown>;
 
@@ -17,17 +17,18 @@ afterAll(async () => {
 const HASH = 'a'.repeat(64);
 const NOW = '2026-10-30T12:00:00.000Z';
 
-const insert = (table: string, row: Row) => {
+const insertWith = (execute: Execute, table: string, row: Row) => {
   const columns = Object.keys(row);
   const placeholders = columns.map(() => '?').join(', ');
-  return db.execute(`insert into ${table} (${columns.join(', ')}) values (${placeholders})`, Object.values(row));
+  return execute(`insert into ${table} (${columns.join(', ')}) values (${placeholders})`, Object.values(row));
 };
+const insert = (table: string, row: Row) => insertWith(db.execute, table, row);
 
 const walletRow = (overrides: Row = {}): Row => ({
   id: randomUUID(),
   player_id: randomUUID(),
   currency: 'BRL',
-  balance: '100.00',
+  balance: '0.00',
   version: 1,
   created_at: NOW,
   updated_at: NOW,
@@ -69,10 +70,35 @@ const ledgerRow = (walletId: string, transactionId: string, overrides: Row = {})
   ...overrides,
 });
 
+/** Wallet sem saldo: não precisa de lançamento. */
 const createWallet = async (overrides: Row = {}) => {
   const row = walletRow(overrides);
   await insert('wallets', row);
   return row.id as string;
+};
+
+/** Wallet com saldo inicial, criada como a aplicação cria: wallet + OPENING + lançamento na mesma transação. */
+const createFundedWallet = async (balance = '100.00', overrides: Row = {}) => {
+  const wallet = walletRow({ balance, ...overrides });
+  const walletId = wallet.id as string;
+  const opening = transactionRow(walletId, {
+    provider_id: 'internal',
+    kind: 'OPENING',
+    amount: balance,
+    currency: wallet.currency,
+  });
+  await db.transaction(async (execute) => {
+    await insertWith(execute, 'wallets', wallet);
+    await insertWith(execute, 'wager_transactions', opening);
+    await insertWith(execute, 'wallet_ledger_entries', ledgerRow(walletId, opening.id as string, {
+      direction: 'CREDIT',
+      amount: balance,
+      currency: wallet.currency,
+      balance_before: '0.00',
+      balance_after: balance,
+    }));
+  });
+  return walletId;
 };
 
 const createTransaction = async (walletId: string, overrides: Row = {}) => {
@@ -81,12 +107,32 @@ const createTransaction = async (walletId: string, overrides: Row = {}) => {
   return row;
 };
 
+/** Movimento completo: transação + lançamento + atualização do saldo, numa única transação SQL. */
+const applyMovement = (walletId: string, transaction: Row, entry: Row, version: number) =>
+  db.transaction(async (execute) => {
+    await insertWith(execute, 'wager_transactions', transaction);
+    await insertWith(execute, 'wallet_ledger_entries', entry);
+    await execute('update wallets set balance = ?, version = ? where id = ?', [entry.balance_after, version, walletId]);
+  });
+
 const createBetWithEntry = async () => {
-  const walletId = await createWallet();
-  const bet = await createTransaction(walletId);
+  const walletId = await createFundedWallet('100.00');
+  const bet = transactionRow(walletId);
   const entry = ledgerRow(walletId, bet.id as string);
-  await insert('wallet_ledger_entries', entry);
+  await applyMovement(walletId, bet, entry, 2);
   return { walletId, bet, entry };
+};
+
+const storedAndLedgerBalance = async (walletId: string) => {
+  const [row] = await db.execute<{ stored: string; ledger: string }>(
+    `select w.balance::text as stored,
+            coalesce(sum(case e.direction when 'CREDIT' then e.amount else -e.amount end), 0)::numeric(20, 2)::text as ledger
+       from wallets w left join wallet_ledger_entries e on e.wallet_id = w.id
+      where w.id = ?
+      group by w.balance`,
+    [walletId],
+  );
+  return row!;
 };
 
 describe('migrations', () => {
@@ -103,8 +149,10 @@ describe('migrations', () => {
 });
 
 describe('wallets', () => {
-  it('accepts a valid wallet', async () => {
+  it('accepts a wallet without balance and a funded wallet with its opening entry', async () => {
     await createWallet();
+    const walletId = await createFundedWallet('100.00');
+    expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '100.00', ledger: '100.00' });
   });
 
   it('allows at most one wallet per player and currency', async () => {
@@ -131,9 +179,26 @@ describe('wallets', () => {
   });
 
   it('stores amounts exactly with scale 2', async () => {
-    const id = await createWallet({ balance: '999999999999999999.99' });
+    const id = await createFundedWallet('999999999999999999.99');
     const [row] = await db.execute<{ balance: string }>('select balance::text as balance from wallets where id = ?', [id]);
     expect(row!.balance).toBe('999999999999999999.99');
+  });
+
+  it.each([
+    ['player_id', 'other-player'],
+    ['currency', 'USD'],
+    ['created_at', '2000-01-01T00:00:00.000Z'],
+  ])('does not allow changing %s', async (column, value) => {
+    const walletId = await createWallet();
+    await expectViolation(
+      db.execute(`update wallets set ${column} = ? where id = ?`, [value, walletId]),
+      SqlState.RestrictViolation,
+    );
+  });
+
+  it('cannot be deleted', async () => {
+    const walletId = await createWallet();
+    await expectViolation(db.execute('delete from wallets where id = ?', [walletId]), SqlState.RestrictViolation);
   });
 });
 
@@ -242,22 +307,39 @@ describe('wager_transactions', () => {
       );
     });
 
-    it('allows only one processed reversal of each kind per reference', async () => {
-      const bet = await createTransaction(walletId);
-      const reversal = (kind: string, status = 'PROCESSED') =>
+    describe('a reference is reversed at most once, by REFUND or ROLLBACK', () => {
+      const reversalOf = (reference: Row, kind: string, status = 'PROCESSED') =>
         createTransaction(walletId, {
           kind,
           status,
-          reference_external_transaction_id: bet.external_transaction_id,
-          reference_transaction_id: bet.id,
+          reference_external_transaction_id: reference.external_transaction_id,
+          reference_transaction_id: reference.id,
           ...(status === 'REJECTED' ? { failure_code: 'REFERENCE_ALREADY_REVERSED', processed_at: null } : {}),
         });
 
-      await reversal('REFUND');
-      await reversal('REFUND', 'REJECTED');
-      await reversal('ROLLBACK');
-      await expectViolation(reversal('REFUND'), SqlState.UniqueViolation, 'wager_transactions_single_reversal_idx');
-      await expectViolation(reversal('ROLLBACK'), SqlState.UniqueViolation, 'wager_transactions_single_reversal_idx');
+      it.each([
+        ['REFUND', 'REFUND'],
+        ['REFUND', 'ROLLBACK'],
+        ['ROLLBACK', 'REFUND'],
+        ['ROLLBACK', 'ROLLBACK'],
+      ])('%s then %s of the same BET', async (first, second) => {
+        const bet = await createTransaction(walletId);
+        await reversalOf(bet, first);
+        await expectViolation(reversalOf(bet, second), SqlState.UniqueViolation, 'wager_transactions_single_reversal_idx');
+      });
+
+      it('rejected reversals do not count', async () => {
+        const bet = await createTransaction(walletId);
+        await reversalOf(bet, 'REFUND', 'REJECTED');
+        await reversalOf(bet, 'ROLLBACK', 'REJECTED');
+        await reversalOf(bet, 'REFUND');
+      });
+
+      it('a REFUND can itself be rolled back', async () => {
+        const bet = await createTransaction(walletId);
+        const refund = await reversalOf(bet, 'REFUND');
+        await reversalOf(refund, 'ROLLBACK');
+      });
     });
   });
 
@@ -307,13 +389,63 @@ describe('wager_transactions', () => {
       ['FAILED without failure_code', { status: 'FAILED', processed_at: null }],
       ['REJECTED with processed_at', { status: 'REJECTED', failure_code: 'INSUFFICIENT_BALANCE' }],
     ])('rejects %s', async (_, overrides) => {
-      await expectViolation(createTransaction(walletId, overrides), SqlState.CheckViolation, 'wager_transactions_status_consistency_check');
+      await expectViolation(
+        createTransaction(walletId, overrides),
+        SqlState.CheckViolation,
+        'wager_transactions_status_consistency_check',
+      );
+    });
+  });
+
+  describe('lifecycle', () => {
+    it('a PENDING transaction can move to a terminal status', async () => {
+      const pending = await createTransaction(walletId, { status: 'PENDING', processed_at: null });
+      await db.execute(`update wager_transactions set status = 'PROCESSED', processed_at = ? where id = ?`, [NOW, pending.id]);
+    });
+
+    it.each<[string, Row]>([
+      ['PROCESSED', {}],
+      ['REJECTED', { status: 'REJECTED', processed_at: null, failure_code: 'INSUFFICIENT_BALANCE' }],
+      ['FAILED', { status: 'FAILED', processed_at: null, failure_code: 'PROCESSING_ERROR' }],
+    ])('a %s transaction never changes again', async (_, overrides) => {
+      const terminal = await createTransaction(walletId, overrides);
+      await expectViolation(
+        db.execute(`update wager_transactions set status = 'PENDING', processed_at = null, failure_code = null where id = ?`, [terminal.id]),
+        SqlState.RestrictViolation,
+      );
+      await expectViolation(
+        db.execute(`update wager_transactions set reference_check_attempts = 9 where id = ?`, [terminal.id]),
+        SqlState.RestrictViolation,
+      );
+    });
+
+    it.each([
+      ['amount', '30.00'],
+      ['kind', 'WIN'],
+      ['wallet_id', randomUUID()],
+      ['payload_hash', 'c'.repeat(64)],
+    ])('the request column %s is immutable even while PENDING', async (column, value) => {
+      const pending = await createTransaction(walletId, { status: 'PENDING', processed_at: null });
+      await expectViolation(
+        db.execute(`update wager_transactions set ${column} = ? where id = ?`, [value, pending.id]),
+        SqlState.RestrictViolation,
+      );
+    });
+
+    it('cannot be deleted', async () => {
+      const pending = await createTransaction(walletId, { status: 'PENDING', processed_at: null });
+      await expectViolation(db.execute('delete from wager_transactions where id = ?', [pending.id]), SqlState.RestrictViolation);
     });
   });
 });
 
 describe('wallet_ledger_entries', () => {
-  it('accepts a balanced entry and assigns an increasing sequence', async () => {
+  it('accepts a full movement and keeps the stored balance equal to the ledger', async () => {
+    const { walletId } = await createBetWithEntry();
+    expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '75.00', ledger: '75.00' });
+  });
+
+  it('assigns an increasing sequence', async () => {
     const first = await createBetWithEntry();
     const second = await createBetWithEntry();
     const rows = await db.execute<{ id: string; sequence: string }>(
@@ -328,7 +460,7 @@ describe('wallet_ledger_entries', () => {
     ['debit with wrong balance after', { balance_after: '76.00' }],
     ['credit computed as debit', { direction: 'CREDIT' }],
   ])('rejects an unbalanced entry: %s', async (_, overrides) => {
-    const walletId = await createWallet();
+    const walletId = await createFundedWallet();
     const bet = await createTransaction(walletId);
     await expectViolation(
       insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string, overrides)),
@@ -338,7 +470,7 @@ describe('wallet_ledger_entries', () => {
   });
 
   it('rejects a negative balance after', async () => {
-    const walletId = await createWallet();
+    const walletId = await createFundedWallet();
     const bet = await createTransaction(walletId);
     await expectViolation(
       insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string, { balance_before: '10.00', balance_after: '-15.00' })),
@@ -350,14 +482,14 @@ describe('wallet_ledger_entries', () => {
   it('allows at most one entry per transaction and wallet', async () => {
     const { walletId, bet } = await createBetWithEntry();
     await expectViolation(
-      insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string)),
+      insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string, { balance_before: '75.00', balance_after: '50.00' })),
       SqlState.UniqueViolation,
       'wallet_ledger_entries_wallet_transaction_key',
     );
   });
 
   it('must use the wallet currency', async () => {
-    const walletId = await createWallet();
+    const walletId = await createFundedWallet();
     const bet = await createTransaction(walletId, { currency: 'USD' });
     await expectViolation(
       insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string, { currency: 'USD' })),
@@ -367,8 +499,8 @@ describe('wallet_ledger_entries', () => {
   });
 
   it('must belong to the same wallet as its transaction', async () => {
-    const walletId = await createWallet();
-    const otherWalletId = await createWallet();
+    const walletId = await createFundedWallet();
+    const otherWalletId = await createFundedWallet();
     const bet = await createTransaction(otherWalletId);
     await expectViolation(
       insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string)),
@@ -378,13 +510,77 @@ describe('wallet_ledger_entries', () => {
   });
 
   it('must move exactly the transaction amount', async () => {
-    const walletId = await createWallet();
+    const walletId = await createFundedWallet();
     const bet = await createTransaction(walletId);
     await expectViolation(
       insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string, { amount: '30.00', balance_after: '70.00' })),
       SqlState.ForeignKeyViolation,
       'wallet_ledger_entries_transaction_fk',
     );
+  });
+
+  describe('stored balance equals the ledger at every commit', () => {
+    it('rejects a wallet created with a balance but no opening entry', async () => {
+      await expectViolation(createWallet({ balance: '100.00' }), SqlState.CheckViolation, 'wallet_balance_ledger_check');
+    });
+
+    it('rejects a balance change without a ledger entry', async () => {
+      const walletId = await createFundedWallet();
+      await expectViolation(
+        db.execute('update wallets set balance = ?, version = 2 where id = ?', ['50.00', walletId]),
+        SqlState.CheckViolation,
+        'wallet_balance_ledger_check',
+      );
+      expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '100.00', ledger: '100.00' });
+    });
+
+    it('rejects a ledger entry without the matching balance change', async () => {
+      const walletId = await createFundedWallet();
+      const bet = await createTransaction(walletId);
+      await expectViolation(
+        insert('wallet_ledger_entries', ledgerRow(walletId, bet.id as string)),
+        SqlState.CheckViolation,
+        'wallet_balance_ledger_check',
+      );
+      expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '100.00', ledger: '100.00' });
+    });
+
+    it('rejects an entry that does not continue from the previous balance', async () => {
+      const walletId = await createFundedWallet('100.00');
+      const bet = transactionRow(walletId);
+      await expectViolation(
+        applyMovement(walletId, bet, ledgerRow(walletId, bet.id as string, { balance_before: '90.00', balance_after: '65.00' }), 2),
+        SqlState.CheckViolation,
+        'wallet_ledger_entries_chain_check',
+      );
+    });
+
+    it('allows the transaction to become PROCESSED later in the same SQL transaction', async () => {
+      const walletId = await createFundedWallet('100.00');
+      const bet = transactionRow(walletId, { status: 'PENDING', processed_at: null });
+      await db.transaction(async (execute) => {
+        await insertWith(execute, 'wager_transactions', bet);
+        await insertWith(execute, 'wallet_ledger_entries', ledgerRow(walletId, bet.id as string));
+        await execute('update wallets set balance = ?, version = 2 where id = ?', ['75.00', walletId]);
+        await execute(`update wager_transactions set status = 'PROCESSED', processed_at = ? where id = ?`, [NOW, bet.id]);
+      });
+      expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '75.00', ledger: '75.00' });
+    });
+
+    it.each<[string, Row]>([
+      ['a LOSS', { kind: 'LOSS' }],
+      ['a REJECTED transaction', { status: 'REJECTED', processed_at: null, failure_code: 'INSUFFICIENT_BALANCE' }],
+      ['a PENDING transaction', { status: 'PENDING', processed_at: null }],
+    ])('rejects an entry for %s', async (_, overrides) => {
+      const walletId = await createFundedWallet('100.00');
+      const transaction = transactionRow(walletId, overrides);
+      await expectViolation(
+        applyMovement(walletId, transaction, ledgerRow(walletId, transaction.id as string), 2),
+        SqlState.CheckViolation,
+        'wallet_ledger_entries_transaction_check',
+      );
+      expect(await storedAndLedgerBalance(walletId)).toEqual({ stored: '100.00', ledger: '100.00' });
+    });
   });
 
   describe('is append-only', () => {
@@ -406,12 +602,6 @@ describe('wallet_ledger_entries', () => {
     it('rejects TRUNCATE', async () => {
       await createBetWithEntry();
       await expectViolation(db.execute('truncate wallet_ledger_entries'), SqlState.RestrictViolation);
-    });
-
-    it('prevents deleting a wallet or transaction that has entries', async () => {
-      const { walletId, bet } = await createBetWithEntry();
-      await expectViolation(db.execute('delete from wallets where id = ?', [walletId]), SqlState.ForeignKeyViolation);
-      await expectViolation(db.execute('delete from wager_transactions where id = ?', [bet.id]), SqlState.ForeignKeyViolation);
     });
   });
 });
