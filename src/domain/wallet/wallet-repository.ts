@@ -1,4 +1,5 @@
 import { DomainError } from '../shared/domain-error';
+import type { Money } from '../shared/money';
 import type { Wallet } from './wallet';
 import type { WalletLedgerEntry } from './wallet-ledger-entry';
 
@@ -44,6 +45,14 @@ export interface LedgerPageItem {
   position: bigint;
 }
 
+export interface LedgerBalanceSnapshot {
+  /** Saldo materializado em `wallets`. */
+  storedBalance: Money;
+  /** Soma dos lançamentos: créditos menos débitos. */
+  ledgerBalance: Money;
+  entries: number;
+}
+
 /** Persistência do ledger: somente inserção e leitura. */
 export abstract class LedgerRepository {
   abstract insert(entry: WalletLedgerEntry): Promise<void>;
@@ -52,4 +61,7 @@ export abstract class LedgerRepository {
 
   /** Até `limit` lançamentos da wallet em ordem de gravação, começando depois de `after` (exclusivo). */
   abstract findPageByWallet(walletId: string, after: bigint | undefined, limit: number): Promise<LedgerPageItem[]>;
+
+  /** Saldo materializado e soma do ledger lidos no mesmo instante (um único snapshot); undefined se a wallet não existe. */
+  abstract balanceSnapshot(walletId: string): Promise<LedgerBalanceSnapshot | undefined>;
 }

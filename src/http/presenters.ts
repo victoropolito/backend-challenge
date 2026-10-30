@@ -1,4 +1,5 @@
 import type { SubmitWagerTransactionResult } from '../application/wagering/submit-wager-transaction.use-case';
+import type { WalletReconciliation } from '../application/wallet/reconcile-wallet.use-case';
 import type { LedgerPage } from '../application/wallet/wallet-queries';
 import type { MoneyProps } from '../domain/shared/money';
 import { WagerTransactionStatus, type WagerTransaction } from '../domain/wagering/wager-transaction';
@@ -29,6 +30,18 @@ function ledgerEntryResponse(entry: WalletLedgerEntry) {
     balanceBefore: entry.balanceBefore.toJSON(),
     balanceAfter: entry.balanceAfter.toJSON(),
     createdAt: entry.createdAt.toISOString(),
+  };
+}
+
+export function reconciliationResponse(reconciliation: WalletReconciliation) {
+  return {
+    walletId: reconciliation.walletId,
+    storedBalance: reconciliation.storedBalance.toJSON(),
+    calculatedBalance: reconciliation.calculatedBalance.toJSON(),
+    difference: reconciliation.difference.toJSON(),
+    consistent: reconciliation.consistent,
+    checkedEntries: reconciliation.checkedEntries,
+    checkedAt: reconciliation.checkedAt.toISOString(),
   };
 }
 

@@ -7,6 +7,7 @@ import {
   WalletAlreadyExistsError,
   WalletConcurrentModificationError,
   WalletRepository,
+  type LedgerBalanceSnapshot,
   type LedgerPageItem,
 } from '../../../domain/wallet/wallet-repository';
 import { LedgerDirection, WalletLedgerEntry } from '../../../domain/wallet/wallet-ledger-entry';
@@ -84,6 +85,37 @@ export class MikroOrmLedgerRepository extends LedgerRepository {
     );
     return records.map((record) => ({ entry: toLedgerEntry(record), position: BigInt(record.sequence!) }));
   }
+
+  async balanceSnapshot(walletId: string): Promise<LedgerBalanceSnapshot | undefined> {
+    const rows = await this.em.getConnection().execute<BalanceSnapshotRow[]>(
+      `select w.balance::text as stored_balance,
+              w.currency,
+              coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end), 0)::numeric(38, 2)::text
+                as ledger_balance,
+              count(l.id)::int as entries
+         from wallets w
+         left join wallet_ledger_entries l on l.wallet_id = w.id
+        where w.id = ?
+        group by w.id`,
+      [walletId],
+    );
+    const row = rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return {
+      storedBalance: Money.rehydrate({ amount: row.stored_balance, currency: row.currency }),
+      ledgerBalance: Money.rehydrate({ amount: row.ledger_balance, currency: row.currency }),
+      entries: row.entries,
+    };
+  }
+}
+
+interface BalanceSnapshotRow {
+  stored_balance: string;
+  currency: string;
+  ledger_balance: string;
+  entries: number;
 }
 
 function toWallet(record: WalletRecord): Wallet {

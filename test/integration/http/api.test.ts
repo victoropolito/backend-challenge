@@ -210,6 +210,50 @@ describe('GET /wallets/:walletId/ledger', () => {
   });
 });
 
+describe('POST /wallets/:walletId/reconciliation', () => {
+  it('compares the stored balance with the ledger', async () => {
+    const wallet = await createWallet('100.00');
+    expect((await submit(transactionBody(wallet))).status).toBe(200);
+
+    const response = await request('POST', `/wallets/${wallet.id}/reconciliation`);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      walletId: wallet.id,
+      storedBalance: { amount: '75.00', currency: 'BRL' },
+      calculatedBalance: { amount: '75.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
+      checkedAt: expect.any(String),
+    });
+  });
+
+  it('signals a divergence in the response', async () => {
+    const wallet = await createWallet('100.00');
+    await db.transaction(async (execute) => {
+      await execute('alter table wallets disable trigger wallets_balance_matches_ledger');
+      await execute(`update wallets set balance = balance - 10 where id = ?`, [wallet.id]);
+      await execute('alter table wallets enable trigger wallets_balance_matches_ledger');
+    });
+
+    const response = await request('POST', `/wallets/${wallet.id}/reconciliation`);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      storedBalance: { amount: '90.00', currency: 'BRL' },
+      calculatedBalance: { amount: '100.00', currency: 'BRL' },
+      difference: { amount: '-10.00', currency: 'BRL' },
+      consistent: false,
+    });
+  });
+
+  it('answers 404 for an unknown wallet and 400 for a malformed id', async () => {
+    expectError(await request('POST', `/wallets/${randomUUID()}/reconciliation`), 404, 'WALLET_NOT_FOUND');
+    expectError(await request('POST', '/wallets/not-a-uuid/reconciliation'), 400, 'VALIDATION_ERROR');
+  });
+});
+
 describe('POST /wagering/transactions', () => {
   it('answers 200 for a processed transaction, and the same response as a replay', async () => {
     const wallet = await createWallet('1000.00');

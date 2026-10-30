@@ -113,6 +113,19 @@ docker compose exec -T postgres psql -U wagering -d wagering -c \
   "select external_transaction_id, reference_external_transaction_id, reference_check_attempts, next_reference_check_at from wager_transactions where status = 'PENDING_REFERENCE' order by next_reference_check_at"
 ```
 
+### Reconciliação
+
+```bash
+curl -s -X POST localhost:3000/wallets/$WALLET/reconciliation   # 200, "consistent": true
+
+# todas as wallets do banco de dev
+for id in $(docker compose exec -T postgres psql -U wagering -d wagering -tAc "select id from wallets"); do
+  curl -s -X POST localhost:3000/wallets/$id/reconciliation | grep -q '"consistent":true' || echo "divergente: $id"
+done
+```
+
+Uma divergência só aparece se as garantias do banco forem contornadas (`ARCHITECTURE.md` §11). Ela vem com `"consistent": false` e a `difference`, e gera no log da aplicação um aviso `[Reconciliation] Wallet … balance diverges from its ledger`.
+
 Consultas: `GET /wallets/$WALLET`, `GET /wallets/$WALLET/ledger?limit=2` (siga o `nextCursor`), `GET /wagering/transactions/<transactionId>`, `GET /providers/provider-a/wagering/transactions/tx-1`. A tabela completa de status está no `ARCHITECTURE.md` §7.1.
 
 ## 6. Validação manual da fila

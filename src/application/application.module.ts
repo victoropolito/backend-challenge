@@ -1,9 +1,10 @@
-import { Module, type Provider } from '@nestjs/common';
+import { Logger, Module, type Provider } from '@nestjs/common';
 import { InboxRepository, OutboxRepository } from '../domain/messaging/messaging-repositories';
 import { WagerTransactionRepository } from '../domain/wagering/wager-transaction-repository';
 import { LedgerRepository, WalletRepository } from '../domain/wallet/wallet-repository';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { isTransientDatabaseError } from '../infrastructure/database/transient-error';
+import { LoggingReconciliationMonitor } from '../infrastructure/observability/logging-reconciliation-monitor';
 import { SystemClock } from '../infrastructure/system/system-clock';
 import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
 import { EventPublisher } from './messaging/event-publisher';
@@ -17,6 +18,8 @@ import { SubmitWagerTransactionUseCase } from './wagering/submit-wager-transacti
 import { WagerTransactionQueries } from './wagering/wager-transaction-queries';
 import { WagerTransactionProcessor } from './wagering/wager-transaction-processor';
 import { CreateWalletUseCase } from './wallet/create-wallet.use-case';
+import { ReconcileWalletUseCase } from './wallet/reconcile-wallet.use-case';
+import { ReconciliationMonitor } from './wallet/reconciliation-monitor';
 import { WalletQueries } from './wallet/wallet-queries';
 
 /** Nome do consumidor da fila de transações na inbox. */
@@ -87,6 +90,12 @@ const USE_CASES: Provider[] = [
       }),
   },
   {
+    provide: ReconcileWalletUseCase,
+    inject: [LedgerRepository, ReconciliationMonitor, Clock],
+    useFactory: (ledger: LedgerRepository, monitor: ReconciliationMonitor, clock: Clock) =>
+      new ReconcileWalletUseCase({ ledger, monitor, clock }),
+  },
+  {
     provide: ConsumeWagerTransactionMessageUseCase,
     inject: [InboxRepository, SubmitWagerTransactionUseCase],
     useFactory: (inbox: InboxRepository, submit: SubmitWagerTransactionUseCase) =>
@@ -124,6 +133,7 @@ const PROCESSOR: Provider = {
   providers: [
     { provide: Clock, useClass: SystemClock },
     { provide: IdGenerator, useClass: UuidV7Generator },
+    { provide: ReconciliationMonitor, useFactory: () => new LoggingReconciliationMonitor(new Logger('Reconciliation')) },
     PROCESSOR,
     ...USE_CASES,
     ...QUERIES,
