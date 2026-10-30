@@ -6,6 +6,7 @@ Este documento registra as decisões técnicas, os trade-offs e as limitações 
 
 ```
 src/
+├── application/            casos de uso; portas Clock, IdGenerator, TransactionRunner; hash canônico
 ├── domain/                 regras de negócio puras (sem NestJS, sem ORM)
 │   ├── shared/             Money, DomainError, backoff, deepFreeze
 │   ├── wallet/             Wallet (aggregate root), WalletLedgerEntry, portas de repositório
@@ -14,12 +15,13 @@ src/
 │   └── messaging/          InboxMessage, OutboxMessage, portas de repositório
 ├── infrastructure/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
-│   └── messaging/          cliente SQS
+│   ├── messaging/          cliente SQS
+│   └── system/             relógio do sistema e gerador de UUIDv7
 ├── health/                 /health/live e /health/ready
 └── config/                 variáveis de ambiente validadas com Zod
 ```
 
-Regra de dependência: `domain` não importa nada de `infrastructure`, NestJS ou MikroORM. A infraestrutura implementa as **portas** declaradas no domínio (`WalletRepository`, `LedgerRepository`, `WagerTransactionRepository`, `InboxRepository`, `OutboxRepository`). As portas são `abstract class`, e não `interface`, porque assim servem ao mesmo tempo de contrato e de token de injeção do NestJS, sem acoplar o domínio ao framework.
+Regra de dependência: `domain` não importa nada de `application`, `infrastructure`, NestJS ou MikroORM; `application` depende só do domínio e das próprias portas (a ligação com o NestJS fica em `ApplicationModule`). A infraestrutura implementa as **portas** declaradas no domínio (`WalletRepository`, `LedgerRepository`, `WagerTransactionRepository`, `InboxRepository`, `OutboxRepository`). As portas são `abstract class`, e não `interface`, porque assim servem ao mesmo tempo de contrato e de token de injeção do NestJS, sem acoplar o domínio ao framework.
 
 Princípio geral: **o banco é a última linha de defesa.** Toda invariante financeira é aplicada no domínio (erro claro e cedo) **e** no schema do PostgreSQL (garantia mesmo diante de bug, concorrência ou acesso direto ao banco).
 
@@ -105,6 +107,12 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
 - `OutboxMessage.enqueue(event)` usa o próprio `eventId` como id da mensagem: republicações carregam o mesmo id e o consumidor deduplica por ele. Retry com backoff exponencial (1 s até o teto de 5 min) e **sem limite de tentativas**: um evento confirmado não pode ser descartado, e uma falha persistente deve aparecer na métrica de atraso da outbox.
 - `InboxMessage` é identificada por `(consumerName, messageId)` e só pode ser marcada como processada uma vez.
 
+### 3.6 Camada de aplicação
+
+- Os casos de uso são classes simples (sem decorators), que recebem as portas no construtor e são registradas no NestJS por factory (`ApplicationModule`).
+- **Portas da aplicação:** `Clock` (instante atual), `IdGenerator` (ids internos, **UUIDv7**: ordenados pelo instante de criação, o que mantém os índices B-tree compactos) e `TransactionRunner` (executa um bloco numa transação SQL; a implementação usa `em.transactional()`, e os repositórios chamados dentro do bloco participam da mesma transação via `AsyncLocalStorage`). Os testes usam relógio fixo.
+- **Criação de wallet (`CreateWalletUseCase`):** numa única transação SQL grava a wallet e, se o saldo inicial for positivo, a transação `OPENING` (`PROCESSED`), o lançamento `CREDIT` de abertura e dois eventos na outbox: `WagerTransactionProcessed` (da `OPENING`) e `WalletBalanceChanged`. Com saldo zero, grava só a wallet. Se qualquer escrita falhar, nada fica gravado. Wallet duplicada para o mesmo `playerId` + moeda lança `WalletAlreadyExistsError` (conflito), inclusive sob criação concorrente: a unicidade é do banco, e o insert concorrente espera o commit do primeiro e então falha.
+
 ## 4. Persistência
 
 ### 4.1 MikroORM e mapeamento
@@ -152,10 +160,12 @@ A unidade de concorrência é a wallet.
 - Testado: duas transações disputando a mesma wallet; a segunda fica comprovadamente bloqueada (`pg_stat_activity`, `wait_event_type = 'Lock'`) e, ao entrar, enxerga o saldo já atualizado.
 - **Planejado:** o caso de uso de submissão adquire o lock antes de verificar o saldo e aplicar a operação; testes com 50 envios paralelos, *hot wallet* e ≥ 3 instâncias.
 
-## 6. Idempotência (planejado, com base já implementada)
+## 6. Idempotência (parcialmente implementado)
 
 - **Implementado:** unicidade persistente por `(provider_id, external_transaction_id)` e `(provider_id, idempotency_key)`; `payload_hash` SHA-256 hex obrigatório no schema; `WagerTransaction.matchesPayload(hash)`; conflitos de inserção concorrente traduzidos para `DuplicateWagerTransactionError`.
-- **Planejado:** o hash é o SHA-256 de um JSON canônico (chaves ordenadas) do subconjunto de campos de negócio. A mesma chave com o mesmo hash é um replay e devolve o resultado original; com outro hash é um conflito, não um replay. Nenhuma idempotência depende de memória.
+- **Algoritmo do hash (implementado em `application/shared/payload-hash.ts`):** `payloadHash = hex(SHA-256(UTF-8(canonicalJson(campos))))`, em hexadecimal minúsculo. O JSON canônico segue as regras do RFC 8785 (JCS) para o subconjunto usado: sem espaços; chaves de objeto ordenadas recursivamente por code unit UTF-16; ordem dos arrays preservada; strings e números serializados como no `JSON.stringify`. Valores que não são JSON puro (`undefined`, `NaN`, `Infinity`, `Date`, `bigint`, instâncias de classe) são **recusados**, nunca descartados em silêncio: um campo ausente precisa ser `null` explícito, para que "ausente" e "nulo" não gerem hashes diferentes por acaso. Strings não passam por normalização Unicode.
+- **Hash da `OPENING`:** `{ kind: "OPENING", walletId, playerId, money: { amount, currency } }`.
+- **Planejado:** o hash da submissão usa o subconjunto de campos de negócio (sem o header `Idempotency-Key` nem metadados de transporte), com o valor já normalizado pelo `Money` (`"25"` e `"25.00"` são o mesmo pedido). A mesma chave com o mesmo hash é um replay e devolve o resultado original; com outro hash é um conflito, não um replay. Nenhuma idempotência depende de memória.
 
 ## 7. Interpretações adotadas
 
@@ -163,6 +173,7 @@ A unidade de concorrência é a wallet.
 |---|---|---|
 | Reversão única (regra 7.4) | Uma transação é revertida **no máximo uma vez, por qualquer tipo** (`REFUND` ou `ROLLBACK`), e não "uma vez por tipo" | Com "uma vez por tipo", uma `BET` poderia receber `REFUND` **e** `ROLLBACK`, devolvendo o valor duas vezes, o que violaria o invariante "não duplicar créditos" |
 | Arredondamento | Valores com mais de 2 casas são rejeitados, não arredondados | Arredondar mudaria em silêncio o valor de uma operação financeira |
+| Eventos da abertura de wallet | A `OPENING` gera `WagerTransactionProcessed` **e** `WalletBalanceChanged`; wallet com saldo zero não gera evento | "Qualquer transação aplicada" inclui a transação interna de abertura, e o saldo mudou de 0 para o inicial |
 | `LOSS` | Aceita valor zero; não gera lançamento nem `WalletBalanceChanged`, mas gera `WagerTransactionProcessed` | `LOSS` apenas registra o resultado da rodada |
 | `WIN`/`LOSS` com referência | Opcional; quando presente, deve apontar para uma `BET` da mesma rodada; o valor de `WIN` pode diferir do da `BET` | Um prêmio não tem o valor da aposta |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
@@ -176,10 +187,10 @@ A unidade de concorrência é a wallet.
 
 ## 9. Testes
 
-- **Unitários** (`test/unit`): `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
-- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente.
+- **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
+- **Integração** (`test/integration`): PostgreSQL real; cada arquivo cria um banco descartável `wagering_test_<aleatório>`, aplica as migrations e o remove ao final. Cada constraint é testada pelo SQLSTATE **e** pelo nome, garantindo que a recusa veio da regra certa. Repositórios testados com ida e volta exata, tradução de conflitos e lock concorrente. Casos de uso testados de ponta a ponta no banco, montados como na aplicação (EntityManager global roteado para a transação): atomicidade (falha no meio desfaz tudo), conflito e criação concorrente da mesma wallet (10 em paralelo → exatamente uma).
 - Nenhum mock de banco. **Planejado:** LocalStack nos testes de mensageria, testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
 ## 10. Pendências
 
-Caso de uso de submissão e endpoints HTTP; consumer SQS (inbox, retry, DLQ, shutdown gracioso); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Caso de uso de submissão de transação; endpoints HTTP (inclusive `POST /wallets`, cujo caso de uso já existe); consumer SQS (inbox, retry, DLQ, shutdown gracioso); publisher da outbox concorrente (`FOR UPDATE SKIP LOCKED`); worker de `PENDING_REFERENCE`; reconciliação; logs estruturados e métricas; autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
