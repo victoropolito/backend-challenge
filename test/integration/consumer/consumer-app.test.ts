@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
 import { createHttpApp } from '../../../src/http/create-http-app';
 import { configureLogging } from '../../../src/infrastructure/observability/structured-logger';
+import { sampleValue } from '../../support/metrics';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
@@ -154,6 +155,11 @@ describe('consumer and outbox publisher in the application', () => {
         events.filter((event) => event.eventType === 'WalletBalanceChanged' && event.data.walletId === wallet.id),
       ).toHaveLength(2);
     });
+
+    const metrics = await (await fetch(`${await baseUrl()}/metrics`)).text();
+    expect(sampleValue(metrics, 'wagering_messages_total{outcome="processed",failure_code=""}')).toBeGreaterThanOrEqual(1);
+    expect(sampleValue(metrics, 'wagering_outbox_published_total')).toBeGreaterThanOrEqual(3);
+    expect(sampleValue(metrics, 'wagering_outbox_pending_messages')).toBeNumber();
 
     const closing = Date.now();
     await app!.close();

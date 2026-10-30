@@ -1,4 +1,5 @@
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
+import type { ExternalTransactionIdConflictError, IdempotencyConflictError } from './submit-wager-transaction.use-case';
 
 export type WagerTransactionOrigin = 'SUBMISSION' | 'RECHECK';
 
@@ -9,4 +10,7 @@ export abstract class WageringMonitor {
 
   /** Submissão repetida respondida com o resultado já gravado. */
   abstract replayed(transaction: WagerTransaction): void;
+
+  /** Submissão recusada porque a idempotency key ou o externalTransactionId já foram usados de outra forma. */
+  abstract conflicted(conflict: IdempotencyConflictError | ExternalTransactionIdConflictError): void;
 }

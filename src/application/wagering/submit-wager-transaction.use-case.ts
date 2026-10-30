@@ -91,7 +91,15 @@ export class SubmitWagerTransactionUseCase {
   constructor(private readonly deps: SubmitWagerTransactionDependencies) {}
 
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmitWagerTransactionResult> {
-    const result = await this.submit(command);
+    let result: SubmitWagerTransactionResult;
+    try {
+      result = await this.submit(command);
+    } catch (error) {
+      if (error instanceof IdempotencyConflictError || error instanceof ExternalTransactionIdConflictError) {
+        this.deps.monitor?.conflicted(error);
+      }
+      throw error;
+    }
     if (result.idempotentReplay) {
       this.deps.monitor?.replayed(result.transaction);
     } else {

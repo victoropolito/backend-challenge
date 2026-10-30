@@ -62,6 +62,9 @@ const monitor = new (class extends WageringMonitor {
   replayed(transaction: WagerTransaction): void {
     this.calls.push(['replayed', transaction.externalTransactionId, undefined]);
   }
+  conflicted(conflict: IdempotencyConflictError | ExternalTransactionIdConflictError): void {
+    this.calls.push(['conflicted', conflict.code, undefined]);
+  }
 })();
 
 const clock = new (class extends Clock {
@@ -619,17 +622,31 @@ describe('SubmitWagerTransactionUseCase', () => {
       ]);
     });
 
-    it('reports nothing when the submission is rolled back or conflicts', async () => {
+    it('reports nothing when the submission is rolled back', async () => {
       const wallet = await openWallet('100.00');
       const bet = command(wallet);
       monitor.calls.length = 0;
 
       await expect(brokenSubmit.execute(bet)).rejects.toThrow('outbox down');
-      await monitoredSubmit.execute(bet);
-      monitor.calls.length = 0;
-      await expect(monitoredSubmit.execute({ ...bet, money: brl('1.00') })).rejects.toBeInstanceOf(IdempotencyConflictError);
 
       expect(monitor.calls).toEqual([]);
+    });
+
+    it('reports idempotency and external id conflicts', async () => {
+      const wallet = await openWallet('100.00');
+      const bet = command(wallet);
+      await monitoredSubmit.execute(bet);
+      monitor.calls.length = 0;
+
+      await expect(monitoredSubmit.execute({ ...bet, money: brl('1.00') })).rejects.toBeInstanceOf(IdempotencyConflictError);
+      await expect(monitoredSubmit.execute({ ...bet, idempotencyKey: randomUUID() })).rejects.toBeInstanceOf(
+        ExternalTransactionIdConflictError,
+      );
+
+      expect(monitor.calls).toEqual([
+        ['conflicted', 'IDEMPOTENCY_CONFLICT', undefined],
+        ['conflicted', 'EXTERNAL_TRANSACTION_ID_CONFLICT', undefined],
+      ]);
     });
   });
 });

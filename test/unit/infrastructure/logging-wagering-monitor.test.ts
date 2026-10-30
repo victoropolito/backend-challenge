@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { IdempotencyConflictError } from '../../../src/application/wagering/submit-wager-transaction.use-case';
 import { Money } from '../../../src/domain/shared/money';
 import { FailureCode } from '../../../src/domain/wagering/failure-code';
 import { WagerTransaction, WagerTransactionKind as Kind } from '../../../src/domain/wagering/wager-transaction';
@@ -84,6 +85,20 @@ describe('LoggingWageringMonitor', () => {
 
     expect(logger.entries).toEqual([
       { level: 'info', message: 'Idempotent replay', fields: { ...identifiers, kind: 'BET', status: 'PROCESSED' } },
+    ]);
+  });
+
+  it('logs submission conflicts with the existing transaction', () => {
+    const logger = new RecordingLogger();
+
+    new LoggingWageringMonitor(logger).conflicted(new IdempotencyConflictError('provider-a', 'provider-a:ext-1', 'tx-0'));
+
+    expect(logger.entries).toEqual([
+      {
+        level: 'info',
+        message: 'Submission conflict',
+        fields: { code: 'IDEMPOTENCY_CONFLICT', providerId: 'provider-a', existingTransactionId: 'tx-0' },
+      },
     ]);
   });
 });

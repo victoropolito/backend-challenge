@@ -11,6 +11,7 @@ import type { ConsumeWagerTransactionMessageUseCase } from '../application/wager
 import { exponentialBackoffDelayMs, type BackoffPolicy } from '../domain/shared/backoff';
 import { addLogContext, withLogContext } from '../infrastructure/observability/log-context';
 import type { AppLogger } from '../infrastructure/observability/structured-logger';
+import type { WageringMetrics } from '../infrastructure/observability/wagering-metrics';
 import { classifyMessageFailure, messageFailureCode, type MessageFailureKind } from './message-failure';
 import { parseWagerTransactionMessage } from './wager-transaction-message';
 
@@ -31,11 +32,12 @@ export interface SqsWagerTransactionConsumerDependencies {
   handler: Pick<ConsumeWagerTransactionMessageUseCase, 'execute'>;
   clock: Clock;
   logger: AppLogger;
+  metrics?: WageringMetrics;
   options: SqsWagerTransactionConsumerOptions;
 }
 
 type Outcome =
-  | { action: 'ack' }
+  | { action: 'ack'; duplicate: boolean }
   | { action: 'retry'; delaySeconds: number; error: unknown }
   | { action: 'dead-letter'; kind: MessageFailureKind; error: unknown };
 
@@ -134,7 +136,9 @@ export class SqsWagerTransactionConsumer {
       const outcome = await withLogContext(
         { sqsMessageId: message.MessageId, receiveCount: receiveCount(message) },
         async () => {
+          const startedAt = performance.now();
           const decided = await this.track(message, () => this.process(message));
+          this.record(decided, (performance.now() - startedAt) / 1_000);
           await this.settle(message, decided);
           return decided;
         },
@@ -167,8 +171,8 @@ export class SqsWagerTransactionConsumer {
         walletId: parsed.command.walletId,
         externalTransactionId: parsed.command.externalTransactionId,
       });
-      await handler.execute(parsed);
-      return { action: 'ack' };
+      const result = await handler.execute(parsed);
+      return { action: 'ack', duplicate: result.duplicate };
     } catch (error) {
       const kind = classifyMessageFailure(error);
       if (kind === 'PERMANENT' || attempt >= options.maxAttempts) {
@@ -177,6 +181,19 @@ export class SqsWagerTransactionConsumer {
       const delayMs = exponentialBackoffDelayMs(attempt, options.retryPolicy);
       return { action: 'retry', delaySeconds: Math.ceil(delayMs / 1_000), error };
     }
+  }
+
+  private record(outcome: Outcome, seconds: number): void {
+    const { metrics } = this.deps;
+    if (metrics === undefined) {
+      return;
+    }
+    const [label, failureCode] =
+      outcome.action === 'ack'
+        ? [outcome.duplicate ? 'duplicate' : 'processed', '']
+        : [outcome.action === 'retry' ? 'retried' : 'dead_lettered', messageFailureCode(outcome.error)];
+    metrics.messages.inc({ outcome: label, failure_code: failureCode });
+    metrics.messageDuration.observe({ outcome: label }, seconds);
   }
 
   /** Executa no SQS a decisão tomada; se o SQS falhar aqui, a mensagem volta sozinha e é reprocessada com segurança. */

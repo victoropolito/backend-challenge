@@ -6,6 +6,13 @@ import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { isTransientDatabaseError } from '../infrastructure/database/transient-error';
 import { LoggingReconciliationMonitor } from '../infrastructure/observability/logging-reconciliation-monitor';
 import { LoggingWageringMonitor } from '../infrastructure/observability/logging-wagering-monitor';
+import {
+  CompositeReconciliationMonitor,
+  CompositeWageringMonitor,
+  MetricsReconciliationMonitor,
+  MetricsWageringMonitor,
+} from '../infrastructure/observability/metrics-monitors';
+import { WageringMetrics } from '../infrastructure/observability/wagering-metrics';
 import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { SystemClock } from '../infrastructure/system/system-clock';
 import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
@@ -145,13 +152,29 @@ const PROCESSOR: Provider = {
   ) => new WagerTransactionProcessor({ wallets, ledger, wagerTransactions, outbox, ids }),
 };
 
-/** Casos de uso e consultas da aplicação, com relógio e gerador de ids do sistema (o relógio é exportado para os adaptadores). */
+/**
+ * Casos de uso e consultas da aplicação, com relógio e gerador de ids do sistema (o relógio é exportado para os
+ * adaptadores) e os monitores de log e métricas.
+ */
 @Module({
   providers: [
     { provide: Clock, useClass: SystemClock },
     { provide: IdGenerator, useClass: UuidV7Generator },
-    { provide: ReconciliationMonitor, useFactory: () => new LoggingReconciliationMonitor(new StructuredLogger('Reconciliation')) },
-    { provide: WageringMonitor, useFactory: () => new LoggingWageringMonitor(new StructuredLogger('Wagering')) },
+    {
+      provide: ReconciliationMonitor,
+      inject: [WageringMetrics],
+      useFactory: (metrics: WageringMetrics) =>
+        new CompositeReconciliationMonitor(
+          new LoggingReconciliationMonitor(new StructuredLogger('Reconciliation')),
+          new MetricsReconciliationMonitor(metrics),
+        ),
+    },
+    {
+      provide: WageringMonitor,
+      inject: [WageringMetrics],
+      useFactory: (metrics: WageringMetrics) =>
+        new CompositeWageringMonitor(new LoggingWageringMonitor(new StructuredLogger('Wagering')), new MetricsWageringMonitor(metrics)),
+    },
     PROCESSOR,
     ...USE_CASES,
     ...QUERIES,

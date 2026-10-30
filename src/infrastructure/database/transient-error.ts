@@ -1,4 +1,5 @@
 import { ConnectionException, DeadlockException, LockWaitTimeoutException } from '@mikro-orm/core';
+import { WalletConcurrentModificationError } from '../../domain/wallet/wallet-repository';
 
 const TRANSIENT_SQLSTATES = new Set([
   '40001', // serialization_failure
@@ -22,4 +23,24 @@ export function isTransientDatabaseError(error: unknown): boolean {
     return false;
   }
   return TRANSIENT_SQLSTATES.has(code) || code.startsWith('08') || TRANSIENT_ERRNOS.has(code);
+}
+
+export type LockConflictReason = 'wallet_version' | 'deadlock' | 'lock_timeout' | 'serialization';
+
+/** Motivo do conflito de lock ou de concorrência que desfez a transação; undefined para outros erros. */
+export function lockConflictReason(error: unknown): LockConflictReason | undefined {
+  if (error instanceof WalletConcurrentModificationError) {
+    return 'wallet_version';
+  }
+  const code = (error as { code?: unknown } | null)?.code;
+  if (error instanceof DeadlockException || code === '40P01') {
+    return 'deadlock';
+  }
+  if (error instanceof LockWaitTimeoutException || code === '55P03') {
+    return 'lock_timeout';
+  }
+  if (code === '40001') {
+    return 'serialization';
+  }
+  return undefined;
 }

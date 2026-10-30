@@ -5,6 +5,7 @@ import { Clock } from '../application/shared/clock';
 import { ConsumeWagerTransactionMessageUseCase } from '../application/wagering/consume-wager-transaction-message.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { StructuredLogger } from '../infrastructure/observability/structured-logger';
+import { WageringMetrics } from '../infrastructure/observability/wagering-metrics';
 import { SqsWagerTransactionConsumer } from './sqs-wager-transaction-consumer';
 
 const QUEUE_LOOKUP_RETRY_MS = 2_000;
@@ -22,6 +23,7 @@ export class ConsumerModule implements OnApplicationBootstrap, BeforeApplication
     @Inject(SQSClient) private readonly sqs: SQSClient,
     @Inject(ConsumeWagerTransactionMessageUseCase) private readonly handler: ConsumeWagerTransactionMessageUseCase,
     @Inject(Clock) private readonly clock: Clock,
+    @Inject(WageringMetrics) private readonly metrics: WageringMetrics,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -52,6 +54,7 @@ export class ConsumerModule implements OnApplicationBootstrap, BeforeApplication
           handler: this.handler,
           clock: this.clock,
           logger: this.logger,
+          metrics: this.metrics,
           options: { ...options, queueUrl: queueUrl!, deadLetterQueueUrl: deadLetterQueueUrl! },
         });
         this.consumer.start();

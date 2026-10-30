@@ -4,6 +4,9 @@ export interface HttpRequest {
   originalUrl: string;
   headers: Record<string, string | string[] | undefined>;
   correlationId?: string;
+  /** Rota que atendeu a requisição (template, ex.: `/wallets/:walletId`), preenchida pelo roteador. */
+  route?: { path?: unknown };
+  baseUrl?: string;
 }
 
 export interface HttpResponse {

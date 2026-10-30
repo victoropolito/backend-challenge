@@ -6,6 +6,7 @@ import { APP_CONFIG, type AppConfig } from '../../config/app-config';
 import { InboxRepository, OutboxRepository } from '../../domain/messaging/messaging-repositories';
 import { WagerTransactionRepository } from '../../domain/wagering/wager-transaction-repository';
 import { LedgerRepository, WalletRepository } from '../../domain/wallet/wallet-repository';
+import { WageringMetrics } from '../observability/wagering-metrics';
 import { buildMikroOrmConfig } from './mikro-orm.config';
 import { MikroOrmTransactionRunner } from './mikro-orm-transaction-runner';
 import { MikroOrmInboxRepository, MikroOrmOutboxRepository } from './repositories/mikro-orm-messaging.repositories';
@@ -18,9 +19,24 @@ const withEntityManager = <T>(token: abstract new (...args: never[]) => T, creat
   useFactory: create,
 });
 
+const withMetrics = <T>(
+  token: abstract new (...args: never[]) => T,
+  create: (em: EntityManager, metrics: WageringMetrics) => T,
+): Provider => ({
+  provide: token,
+  inject: [EntityManager, WageringMetrics],
+  useFactory: create,
+});
+
 const PROVIDERS: Provider[] = [
-  withEntityManager(TransactionRunner, (em) => new MikroOrmTransactionRunner(em)),
-  withEntityManager(WalletRepository, (em) => new MikroOrmWalletRepository(em)),
+  withMetrics(
+    TransactionRunner,
+    (em, metrics) => new MikroOrmTransactionRunner(em, (reason) => metrics.lockConflicts.inc({ reason })),
+  ),
+  withMetrics(
+    WalletRepository,
+    (em, metrics) => new MikroOrmWalletRepository(em, (seconds) => metrics.walletLockWait.observe({}, seconds)),
+  ),
   withEntityManager(LedgerRepository, (em) => new MikroOrmLedgerRepository(em)),
   withEntityManager(WagerTransactionRepository, (em) => new MikroOrmWagerTransactionRepository(em)),
   withEntityManager(InboxRepository, (em) => new MikroOrmInboxRepository(em)),

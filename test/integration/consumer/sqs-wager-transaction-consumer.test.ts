@@ -15,6 +15,7 @@ import {
 } from '../../../src/consumer/sqs-wager-transaction-consumer';
 import { parseWagerTransactionMessage } from '../../../src/consumer/wager-transaction-message';
 import { silentLogger } from '../../support/loggers';
+import { sampleValue } from '../../support/metrics';
 import { Money } from '../../../src/domain/shared/money';
 import type { Wallet } from '../../../src/domain/wallet/wallet';
 import { MikroOrmTransactionRunner } from '../../../src/infrastructure/database/mikro-orm-transaction-runner';
@@ -27,6 +28,7 @@ import {
   MikroOrmLedgerRepository,
   MikroOrmWalletRepository,
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
+import { WageringMetrics } from '../../../src/infrastructure/observability/wagering-metrics';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
@@ -82,12 +84,14 @@ const startConsumer = (
   q: TestQueues,
   handler: Handler = useCase,
   options: Partial<SqsWagerTransactionConsumerOptions> = {},
+  metrics?: WageringMetrics,
 ): SqsWagerTransactionConsumer => {
   const consumer = new SqsWagerTransactionConsumer({
     sqs: q.sqs,
     handler,
     clock,
     logger: silentLogger,
+    ...(metrics ? { metrics } : {}),
     options: {
       queueUrl: q.queueUrl,
       deadLetterQueueUrl: q.dlqUrl,
@@ -237,6 +241,27 @@ describe('SqsWagerTransactionConsumer', () => {
     expect(await q.readDlq()).toEqual([]);
   });
 
+  it('counts each message by outcome and failure code, with its processing time', async () => {
+    const q = await queues();
+    const metrics = new WageringMetrics();
+    const wallet = await openWallet();
+    const body = messageBody(wallet);
+    startConsumer(q, useCase, {}, metrics);
+
+    await q.send(body, wallet.id);
+    await q.send(body, wallet.id);
+    await q.send('{"messageId":', 'group-1');
+
+    await eventually(async () => expect(await q.readDlq()).toHaveLength(1));
+    await expectDrained(q);
+    const text = await metrics.render();
+    expect(sampleValue(text, 'wagering_messages_total{outcome="processed",failure_code=""}')).toBe(1);
+    expect(sampleValue(text, 'wagering_messages_total{outcome="duplicate",failure_code=""}')).toBe(1);
+    expect(sampleValue(text, 'wagering_messages_total{outcome="dead_lettered",failure_code="MALFORMED_MESSAGE"}')).toBe(1);
+    expect(sampleValue(text, 'wagering_message_processing_seconds_count{outcome="processed"}')).toBe(1);
+    expect(sampleValue(text, 'wagering_message_processing_seconds_count{outcome="dead_lettered"}')).toBe(1);
+  });
+
   it('acknowledges a message whose transaction was committed before a crash, without applying it again', async () => {
     const q = await queues();
     const wallet = await openWallet();
@@ -294,7 +319,8 @@ describe('SqsWagerTransactionConsumer', () => {
     const q = await queues();
     const wallet = await openWallet();
     const { handler, calls } = failing(2, connectionLost());
-    startConsumer(q, handler);
+    const metrics = new WageringMetrics();
+    startConsumer(q, handler, {}, metrics);
 
     await q.send(messageBody(wallet), wallet.id);
 
@@ -304,6 +330,9 @@ describe('SqsWagerTransactionConsumer', () => {
     expect(calls[2]!.getTime() - calls[1]!.getTime()).toBeGreaterThanOrEqual(900);
     await expectDrained(q);
     expect(await q.readDlq()).toEqual([]);
+    const text = await metrics.render();
+    expect(sampleValue(text, 'wagering_messages_total{outcome="retried",failure_code="ECONNRESET"}')).toBe(2);
+    expect(sampleValue(text, 'wagering_messages_total{outcome="processed",failure_code=""}')).toBe(1);
   });
 
   it('sends a message to the DLQ once the attempts are exhausted', async () => {

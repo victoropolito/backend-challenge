@@ -1,3 +1,7 @@
+import type {
+  ExternalTransactionIdConflictError,
+  IdempotencyConflictError,
+} from '../../application/wagering/submit-wager-transaction.use-case';
 import { WageringMonitor, type WagerTransactionOrigin } from '../../application/wagering/wagering-monitor';
 import { WagerTransactionStatus, type WagerTransaction } from '../../domain/wagering/wager-transaction';
 import type { LogFields } from './log-context';
@@ -25,6 +29,14 @@ export class LoggingWageringMonitor extends WageringMonitor {
 
   replayed(transaction: WagerTransaction): void {
     this.logger.info('Idempotent replay', identifiers(transaction));
+  }
+
+  conflicted(conflict: IdempotencyConflictError | ExternalTransactionIdConflictError): void {
+    this.logger.info('Submission conflict', {
+      code: conflict.code,
+      providerId: conflict.providerId,
+      existingTransactionId: conflict.existingTransactionId,
+    });
   }
 }
 

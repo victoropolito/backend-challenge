@@ -72,6 +72,18 @@ bun run start | jq -c 'select(.message == "Wager transaction recorded") | {trans
 
 Linhas esperadas: `HTTP request` (uma por requisição), `Wager transaction recorded` (um desfecho novo), `Idempotent replay`, `Message failed, will retry` e `Message sent to the DLQ` (consumidor), `Wallet balance diverges from its ledger` (reconciliação). Os detalhes estão no `ARCHITECTURE.md` §12.
 
+### Métricas
+
+`GET /metrics` devolve as métricas no formato do Prometheus. Para conferir à mão:
+
+```bash
+curl -s localhost:3000/metrics | grep -v '^#'                                   # todas as séries
+curl -s localhost:3000/metrics | grep -E '^wagering_(transactions|messages)_total'
+curl -s localhost:3000/metrics | grep -E '^wagering_outbox_(pending|oldest)'     # atraso da outbox
+```
+
+Depois de uma aposta pela API, espere ver `wagering_transactions_total{kind="BET",status="PROCESSED",...} 1`, `wagering_wallet_lock_wait_seconds_count 1` e `http_request_duration_seconds_count{method="POST",route="/wagering/transactions",status_code="200"} 1`. A lista completa e o significado de cada métrica estão no `ARCHITECTURE.md` §12.3.
+
 ## 4. Testes automatizados
 
 ```bash

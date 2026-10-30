@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
 import { createHttpApp } from '../../../src/http/create-http-app';
+import { sampleValue } from '../../support/metrics';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 
 let db: TestDatabase;
@@ -425,6 +426,56 @@ describe('GET transactions', () => {
     expectError(await request('GET', `/wagering/transactions/${randomUUID()}`), 404, 'TRANSACTION_NOT_FOUND');
     expectError(await request('GET', '/providers/provider-a/wagering/transactions/unknown'), 404, 'TRANSACTION_NOT_FOUND');
     expectError(await request('GET', '/wagering/transactions/not-a-uuid'), 400, 'VALIDATION_ERROR');
+  });
+});
+
+describe('GET /metrics', () => {
+  const scrape = async () => {
+    const response = await fetch(`${baseUrl}/metrics`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toStartWith('text/plain; version=0.0.4');
+    const text = await response.text();
+    return (series: string) => sampleValue(text, series) ?? 0;
+  };
+
+  it('counts outcomes, replays, conflicts and reconciliations, and times requests by route template', async () => {
+    const before = await scrape();
+    const wallet = await createWallet();
+    const bet = transactionBody(wallet);
+
+    expect((await submit(bet)).status).toBe(200);
+    expect((await submit(bet)).status).toBe(200);
+    expect((await submit({ ...bet, money: { amount: '1.00', currency: 'BRL' } })).status).toBe(409);
+    expect((await submit(transactionBody(wallet, { money: { amount: '500.00', currency: 'BRL' } }))).status).toBe(422);
+    expect((await request('GET', `/wallets/${wallet.id}`)).status).toBe(200);
+    expect((await request('POST', `/wallets/${wallet.id}/reconciliation`)).status).toBe(200);
+    expect((await request('GET', `/wallets/${randomUUID()}/nothing-here`)).status).toBe(404);
+    const after = await scrape();
+
+    const delta = (series: string) => after(series) - before(series);
+    expect(delta('wagering_transactions_total{kind="BET",status="PROCESSED",failure_code="",origin="SUBMISSION"}')).toBe(1);
+    expect(
+      delta('wagering_transactions_total{kind="BET",status="REJECTED",failure_code="INSUFFICIENT_BALANCE",origin="SUBMISSION"}'),
+    ).toBe(1);
+    expect(delta('wagering_idempotent_replays_total{kind="BET",status="PROCESSED"}')).toBe(1);
+    expect(delta('wagering_submission_conflicts_total{code="IDEMPOTENCY_CONFLICT"}')).toBe(1);
+    expect(delta('wagering_reconciliations_total{result="consistent"}')).toBe(1);
+    expect(delta('wagering_wallet_lock_wait_seconds_count')).toBe(2);
+    expect(delta('http_request_duration_seconds_count{method="POST",route="/wagering/transactions",status_code="200"}')).toBe(2);
+    expect(delta('http_request_duration_seconds_count{method="POST",route="/wagering/transactions",status_code="409"}')).toBe(1);
+    expect(delta('http_request_duration_seconds_count{method="GET",route="/wallets/:walletId",status_code="200"}')).toBe(1);
+    expect(delta('http_request_duration_seconds_count{method="GET",route="unmatched",status_code="404"}')).toBe(1);
+  });
+
+  it('exports the backlog read from the database', async () => {
+    await createWallet();
+    const read = await scrape();
+
+    const [row] = await db.execute<{ pending: number }>('select count(*)::int as pending from outbox_messages where published_at is null');
+    expect(read('wagering_outbox_pending_messages')).toBe(row!.pending);
+    expect(read('wagering_outbox_pending_messages')).toBeGreaterThan(0);
+    expect(read('wagering_outbox_oldest_pending_age_seconds')).toBeGreaterThan(0);
+    expect(read('wagering_pending_reference_transactions')).toBeGreaterThanOrEqual(0);
   });
 });
 

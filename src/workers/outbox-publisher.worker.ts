@@ -1,5 +1,6 @@
 import type { PublishOutboxUseCase } from '../application/messaging/publish-outbox.use-case';
 import type { AppLogger } from '../infrastructure/observability/structured-logger';
+import type { WageringMetrics } from '../infrastructure/observability/wagering-metrics';
 import { PollingLoop } from './polling-loop';
 
 export interface OutboxPublisherWorkerOptions {
@@ -11,6 +12,7 @@ export interface OutboxPublisherWorkerOptions {
 export interface OutboxPublisherWorkerDependencies {
   publish: Pick<PublishOutboxUseCase, 'execute'>;
   logger: AppLogger;
+  metrics?: WageringMetrics;
   options: OutboxPublisherWorkerOptions;
 }
 
@@ -23,11 +25,13 @@ export class OutboxPublisherWorker {
   private readonly loop: PollingLoop;
 
   constructor(deps: OutboxPublisherWorkerDependencies) {
-    const { publish, logger, options } = deps;
+    const { publish, logger, metrics, options } = deps;
     this.loop = new PollingLoop({
       idleDelayMs: options.idleDelayMs,
       tick: async () => {
         const result = await publish.execute(options.batchSize);
+        metrics?.outboxPublished.inc({}, result.published);
+        metrics?.outboxPublishFailures.inc({}, result.failures.size);
         for (const [id, reason] of result.failures) {
           logger.warn('Event not published, will retry', { eventId: id, reason });
         }

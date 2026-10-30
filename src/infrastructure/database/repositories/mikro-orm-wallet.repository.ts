@@ -15,9 +15,15 @@ import { WalletSchema, type WalletRecord } from '../records/wallet.record';
 import { WalletLedgerEntrySchema, type WalletLedgerEntryRecord } from '../records/wallet-ledger-entry.record';
 import { violatedUniqueConstraint } from './constraint-violation';
 
-/** WalletRepository sobre MikroORM: leituras sem identity map e escritas nativas com controle de version. */
+/**
+ * WalletRepository sobre MikroORM: leituras sem identity map e escritas nativas com controle de version.
+ * `onLockWait` recebe o tempo, em segundos, para obter o lock da wallet.
+ */
 export class MikroOrmWalletRepository extends WalletRepository {
-  constructor(private readonly em: EntityManager) {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly onLockWait?: (seconds: number) => void,
+  ) {
     super();
   }
 
@@ -27,11 +33,13 @@ export class MikroOrmWalletRepository extends WalletRepository {
   }
 
   async findByIdForUpdate(id: string): Promise<Wallet | undefined> {
+    const startedAt = performance.now();
     const record = await this.em.findOne(
       WalletSchema,
       { id },
       { lockMode: LockMode.PESSIMISTIC_WRITE, disableIdentityMap: true },
     );
+    this.onLockWait?.((performance.now() - startedAt) / 1_000);
     return record ? toWallet(record) : undefined;
   }
 

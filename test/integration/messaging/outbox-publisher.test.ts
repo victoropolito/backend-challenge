@@ -14,9 +14,11 @@ import {
   MikroOrmWalletRepository,
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { SqsEventPublisher } from '../../../src/infrastructure/messaging/sqs-event-publisher';
+import { WageringMetrics } from '../../../src/infrastructure/observability/wagering-metrics';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { OutboxPublisherWorker } from '../../../src/workers/outbox-publisher.worker';
 import { silentLogger } from '../../support/loggers';
+import { sampleValue } from '../../support/metrics';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
@@ -62,14 +64,19 @@ afterAll(async () => {
 
 const publisherFor = (queueName: string) => new SqsEventPublisher(queues.sqs, { queueName, timeoutMs: 5_000 });
 
-const startWorker = () => {
+const startWorker = (metrics?: WageringMetrics) => {
   const publish = new PublishOutboxUseCase({
     transactions: new MikroOrmTransactionRunner(db.orm.em),
     outbox: new MikroOrmOutboxRepository(db.orm.em),
     publisher: publisherFor(queues.eventsQueueName),
     clock,
   });
-  const worker = new OutboxPublisherWorker({ publish, logger: silentLogger, options: { batchSize: 10, idleDelayMs: 100 } });
+  const worker = new OutboxPublisherWorker({
+    publish,
+    logger: silentLogger,
+    ...(metrics ? { metrics } : {}),
+    options: { batchSize: 10, idleDelayMs: 100 },
+  });
   worker.start();
   stops.push(() => worker.stop());
   return worker;
@@ -137,10 +144,14 @@ describe('OutboxPublisherWorker', () => {
       ),
     );
     expect(await pendingCount()).toBe(10);
+    const metrics = new WageringMetrics();
 
-    startWorker();
+    startWorker(metrics);
 
     await eventually(async () => expect(await pendingCount()).toBe(0));
+    const text = await metrics.render();
+    expect(sampleValue(text, 'wagering_outbox_published_total')).toBe(10);
+    expect(sampleValue(text, 'wagering_outbox_publish_failures_total')).toBe(0);
     const events = (await queues.drainEvents()).map((item) => JSON.parse(item.Body!));
     expect(events).toHaveLength(10);
     for (const wallet of wallets) {

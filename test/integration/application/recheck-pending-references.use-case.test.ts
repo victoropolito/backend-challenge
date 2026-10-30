@@ -369,6 +369,7 @@ describe('RecheckPendingReferencesUseCase monitor', () => {
           calls.push([transaction.id, transaction.status, origin]);
         }
         replayed(): void {}
+        conflicted(): void {}
       })(),
     });
     const wallet = await openWallet('100.00');
