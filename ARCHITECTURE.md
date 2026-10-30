@@ -178,7 +178,7 @@ A unidade de concorrência é a wallet.
 - Testado: duas transações disputando a mesma wallet; a segunda fica comprovadamente bloqueada (`pg_stat_activity`, `wait_event_type = 'Lock'`) e, ao entrar, enxerga o saldo já atualizado.
 - **Implementado no caso de uso de submissão:** o lock é adquirido antes de qualquer decisão (idempotência, referência, reversão única, saldo), então a decisão sempre vê o estado mais recente da wallet (`READ COMMITTED`: cada comando lê o que já foi confirmado). A referência de uma reversão precisa ser da mesma wallet, então a regra "reverter uma vez" também fica serializada pelo mesmo lock. O índice único de reversão continua como garantia final.
 - **Testado com paralelismo real** (conexões concorrentes ao PostgreSQL): o cenário obrigatório (100,00 e duas apostas de 80,00) repetido em 10 wallets ao mesmo tempo; 50 submissões idênticas (1 aplicada, 49 replays, 1 lançamento); 50 apostas numa *hot wallet* (nunca fica negativa; 20 aplicadas, 30 rejeitadas); `REFUND` e `ROLLBACK` simultâneos da mesma aposta (só uma reversão); wallets diferentes em paralelo; e **ausência de lock global**: com a wallet A travada por outra transação, uma aposta na wallet B termina enquanto a de A continua esperando (com um lock global de propósito, o teste falha por timeout). Retirando o lock (`findById` no lugar de `findByIdForUpdate`), esses testes falham, o que confirma que eles detectam a corrida.
-- **Planejado:** teste com ≥ 3 instâncias da aplicação.
+- **Testado com várias instâncias reais:** 3 processos da aplicação sobre o mesmo banco e as mesmas filas, com as apostas concorrentes de cada wallet enviadas a instâncias diferentes, e uma instância morta (`SIGKILL`) no meio de uma rajada de mensagens. Ver a seção 15.
 
 ## 6. Idempotência
 
@@ -510,8 +510,29 @@ Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), �
 - **Corrida na verificação de idempotência:** um repositório que deixa de achar a idempotency key uma vez simula a submissão idêntica confirmada entre as duas leituras. O resultado tem de ser replay (ou conflito de payload), e não conflito de `externalTransactionId`. Sem a correção, o teste falha. O teste de 20 entregas paralelas da mesma mensagem, que falhava às vezes por essa corrida, passou em 12 execuções seguidas.
 - **Métricas:** formato de exposição do Prometheus (contadores, histogramas cumulativos com `+Inf`, gauges lidos na coleta, escape de labels e help, nome duplicado recusado); backlog lido uma vez por coleta e omitido sem derrubar o resto quando o banco falha; monitores de métricas e compostos. No banco real: contagem da outbox pendente, idade do evento mais antigo e `PENDING_REFERENCE`; tempo de espera pelo lock da wallet medido com outra transação segurando o lock; `TransactionRunner` contando `lock_timeout` e `wallet_version`, e não outros erros. No LocalStack: mensagens `processed`, `duplicate`, `retried` (com o código) e `dead_lettered`, com o tempo de processamento; eventos publicados pelo worker. Na aplicação real: `/metrics` com desfechos, replays, conflitos, reconciliações, espera de lock e latência pelo template da rota (inclusive `unmatched`), e o backlog igual ao do banco.
 - **Invariante final:** todo arquivo de integração que movimenta saldo termina com um teste que confere, para todas as wallets do banco descartável, saldo = soma do ledger = `balance_after` do último lançamento. O teste de reconciliação, que provoca divergências de propósito, fica de fora; o teste de divergência da API desfaz a adulteração ao terminar.
-- Nenhum mock de banco nem de fila. **Planejado:** testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
+- **Várias instâncias reais** (`test/integration/multi-instance`, também via `bun run test:multi-instance`):
+  - **Montagem:** o teste sobe 3 processos da aplicação (`bun run src/main.ts`), cada um com API, consumidor, publisher da outbox e worker de `PENDING_REFERENCE`, sobre o mesmo banco descartável e as mesmas filas.
+  - **Pela API:** o cenário 100,00 / 80,00 + 80,00 em 10 wallets, com cada aposta enviada a uma instância diferente. A mesma aposta 30 vezes em paralelo, espalhada pelas instâncias, gera um débito só. 60 apostas numa *hot wallet* dão 30 aplicadas, 30 rejeitadas e saldo 0.
+  - **Pela fila:** 8 wallets, cada uma com um `WIN` antes da sua `BET` e 40 `BET`s entregues duas vezes cada. Com cerca de 20% processado, uma instância é morta com `SIGKILL`, sem shutdown, e uma substituta sobe. No fim: 328 transações, todas `PROCESSED`, aplicadas uma vez cada (saldo, lançamentos e inbox exatos), DLQ vazia. As métricas de cada instância mostram que todas consumiram.
+  - **Eventos:** a outbox escrita por todas as instâncias é publicada inteira, cada `eventId` uma única vez.
+  - **Reinício:** com todas as instâncias mortas, uma nova sobe sobre o mesmo estado, não altera nada e atende normalmente.
+  - **Mutação conferida:** sem o lock da wallet na submissão, os testes do cenário 80/80 e da *hot wallet* falham.
+- **Cobertura da lista obrigatória de concorrência (seção 13 do enunciado):**
+
+  | Item | Onde |
+  |---|---|
+  | Mesma aposta 50× em paralelo → um débito | caso de uso (50 submissões); fila (20 entregas da mesma mensagem e 50 mensagens da mesma transação); 3 instâncias (30× pela API) |
+  | Operações disputando o saldo da mesma wallet | cenário 80/80 (10 wallets ao mesmo tempo, no caso de uso, na API e com 3 instâncias); *hot wallet* com 50 e 60 apostas |
+  | Wallets distintas em paralelo | wallets independentes e ausência de lock global (wallet A travada não bloqueia a B) |
+  | ≥ 3 processos/instâncias | `multi-instance.test.ts` (3 processos, mais 1 substituto e 1 de reinício) |
+  | Worker morto depois do commit e antes do ack | consumidor: mensagem já commitada e reentregue é confirmada sem reaplicar; 3 instâncias: `SIGKILL` no meio da rajada |
+  | Dois publishers sobre a mesma outbox | 2 e 5 publishers no caso de uso; 3 workers no LocalStack; até 4 instâncias publicando juntas |
+  | `ROLLBACK`/`REFUND` antes da referência | reverificação: cadeia `ROLLBACK` → `WIN` → `BET` recebida de trás para frente; `WIN` antes da `BET` pela fila (app real e 3 instâncias) |
+  | Reinício com consistência final | 3 instâncias (substituta e reinício completo); `scripts/sigterm-check.sh` (`SIGTERM` real em container) |
+  | Invariante final `wallet.balance == ledger` | teste final em cada arquivo de integração que movimenta saldo (inclusive o de várias instâncias) |
+
+- Nenhum mock de banco nem de fila.
 
 ## 16. Pendências
 
-Testes de concorrência e de falha (≥ 3 instâncias, reinício com consistência final); README de setup.
+README de setup.

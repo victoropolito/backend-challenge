@@ -99,9 +99,10 @@ bun run typecheck
 bun test                      # tudo; precisa da infra no ar
 bun run test:unit             # só unitários (sem infra)
 bun run test:integration      # PostgreSQL e LocalStack reais
+bun run test:multi-instance   # 3 processos da aplicação sobre o mesmo banco e filas, com crash e reinício
 ```
 
-Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes de mensageria criam filas `wager-test-<aleatório>.fifo` + DLQ + eventos (removidas no fim). Os testes HTTP desligam o consumidor, o publisher da outbox e o worker de `PENDING_REFERENCE`.
+Os testes de integração não tocam no banco nem nas filas de dev: cada arquivo cria um banco `wagering_test_<aleatório>` (removido no fim), e os testes de mensageria criam filas `wager-test-<aleatório>.fifo` + DLQ + eventos (removidas no fim). Os testes HTTP desligam o consumidor, o publisher da outbox e o worker de `PENDING_REFERENCE`. O teste de várias instâncias sobe processos `bun run src/main.ts` em portas livres, com `LOG_LEVEL=warn`, e os mata com `SIGKILL` (sem shutdown gracioso, de propósito); leva cerca de 15 s. Se for interrompido no meio (Ctrl+C), confira se sobrou algum processo `bun` e algum banco `wagering_test_*` (comandos de limpeza na seção 8).
 
 ## 5. Validação manual da API
 
