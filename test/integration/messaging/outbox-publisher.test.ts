@@ -15,7 +15,8 @@ import {
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { SqsEventPublisher } from '../../../src/infrastructure/messaging/sqs-event-publisher';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
-import { OutboxPublisherWorker, type WorkerLogger } from '../../../src/workers/outbox-publisher.worker';
+import { OutboxPublisherWorker } from '../../../src/workers/outbox-publisher.worker';
+import { silentLogger } from '../../support/loggers';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
@@ -31,8 +32,6 @@ const clock = new (class extends Clock {
     return new Date();
   }
 })();
-
-const silentLogger: WorkerLogger = { log() {}, warn() {}, error() {} };
 
 beforeAll(async () => {
   db = await createTestDatabase();

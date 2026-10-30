@@ -1,10 +1,12 @@
-import { Logger, Module, type Provider } from '@nestjs/common';
+import { Module, type Provider } from '@nestjs/common';
 import { InboxRepository, OutboxRepository } from '../domain/messaging/messaging-repositories';
 import { WagerTransactionRepository } from '../domain/wagering/wager-transaction-repository';
 import { LedgerRepository, WalletRepository } from '../domain/wallet/wallet-repository';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
 import { isTransientDatabaseError } from '../infrastructure/database/transient-error';
 import { LoggingReconciliationMonitor } from '../infrastructure/observability/logging-reconciliation-monitor';
+import { LoggingWageringMonitor } from '../infrastructure/observability/logging-wagering-monitor';
+import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { SystemClock } from '../infrastructure/system/system-clock';
 import { UuidV7Generator } from '../infrastructure/system/uuid-v7-generator';
 import { EventPublisher } from './messaging/event-publisher';
@@ -17,6 +19,7 @@ import { RecheckPendingReferencesUseCase } from './wagering/recheck-pending-refe
 import { SubmitWagerTransactionUseCase } from './wagering/submit-wager-transaction.use-case';
 import { WagerTransactionQueries } from './wagering/wager-transaction-queries';
 import { WagerTransactionProcessor } from './wagering/wager-transaction-processor';
+import { WageringMonitor } from './wagering/wagering-monitor';
 import { CreateWalletUseCase } from './wallet/create-wallet.use-case';
 import { ReconcileWalletUseCase } from './wallet/reconcile-wallet.use-case';
 import { ReconciliationMonitor } from './wallet/reconciliation-monitor';
@@ -49,6 +52,7 @@ const USE_CASES: Provider[] = [
       InboxRepository,
       Clock,
       IdGenerator,
+      WageringMonitor,
     ],
     useFactory: (
       transactions: TransactionRunner,
@@ -58,7 +62,9 @@ const USE_CASES: Provider[] = [
       inbox: InboxRepository,
       clock: Clock,
       ids: IdGenerator,
-    ) => new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids }),
+      monitor: WageringMonitor,
+    ) =>
+      new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids, monitor }),
   },
   {
     provide: PublishOutboxUseCase,
@@ -68,7 +74,16 @@ const USE_CASES: Provider[] = [
   },
   {
     provide: RecheckPendingReferencesUseCase,
-    inject: [APP_CONFIG, TransactionRunner, WalletRepository, WagerTransactionRepository, WagerTransactionProcessor, Clock, IdGenerator],
+    inject: [
+      APP_CONFIG,
+      TransactionRunner,
+      WalletRepository,
+      WagerTransactionRepository,
+      WagerTransactionProcessor,
+      Clock,
+      IdGenerator,
+      WageringMonitor,
+    ],
     useFactory: (
       config: AppConfig,
       transactions: TransactionRunner,
@@ -77,6 +92,7 @@ const USE_CASES: Provider[] = [
       processor: WagerTransactionProcessor,
       clock: Clock,
       ids: IdGenerator,
+      monitor: WageringMonitor,
     ) =>
       new RecheckPendingReferencesUseCase({
         transactions,
@@ -87,6 +103,7 @@ const USE_CASES: Provider[] = [
         ids,
         maxAttempts: config.referenceWorker.maxAttempts,
         isTransientError: isTransientDatabaseError,
+        monitor,
       }),
   },
   {
@@ -133,7 +150,8 @@ const PROCESSOR: Provider = {
   providers: [
     { provide: Clock, useClass: SystemClock },
     { provide: IdGenerator, useClass: UuidV7Generator },
-    { provide: ReconciliationMonitor, useFactory: () => new LoggingReconciliationMonitor(new Logger('Reconciliation')) },
+    { provide: ReconciliationMonitor, useFactory: () => new LoggingReconciliationMonitor(new StructuredLogger('Reconciliation')) },
+    { provide: WageringMonitor, useFactory: () => new LoggingWageringMonitor(new StructuredLogger('Wagering')) },
     PROCESSOR,
     ...USE_CASES,
     ...QUERIES,

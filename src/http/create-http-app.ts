@@ -1,17 +1,24 @@
-import type { INestApplication, LogLevel } from '@nestjs/common';
+import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
+import { loadConfig } from '../config/app-config';
+import { NestJsonLogger } from '../infrastructure/observability/nest-json-logger';
+import { configureLogging } from '../infrastructure/observability/structured-logger';
 import { correlationIdMiddleware } from './correlation-id';
 import { HttpErrorFilter } from './http-error.filter';
+import { requestLogMiddleware } from './request-log';
 
 export interface CreateHttpAppOptions {
-  logger?: LogLevel[] | false;
+  /** false silencia todos os logs (testes); sem a opção, vale o LOG_LEVEL da config. */
+  logger?: false;
 }
 
-/** Cria a aplicação Nest com o correlation id e o filtro de erros globais; usada pelo bootstrap e pelos testes. */
+/** Cria a aplicação Nest com logs JSON, correlation id, log de requisições e o filtro de erros globais. */
 export async function createHttpApp(options: CreateHttpAppOptions = {}): Promise<INestApplication> {
-  const app = await NestFactory.create(AppModule, options.logger === undefined ? {} : { logger: options.logger });
+  configureLogging({ level: options.logger === false ? 'silent' : loadConfig().logLevel });
+  const app = await NestFactory.create(AppModule, { logger: new NestJsonLogger() });
   app.use(correlationIdMiddleware);
+  app.use(requestLogMiddleware);
   app.useGlobalFilters(new HttpErrorFilter());
   app.enableShutdownHooks();
   return app;

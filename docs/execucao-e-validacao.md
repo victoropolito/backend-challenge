@@ -44,6 +44,7 @@ A aplicação sobe a API HTTP, o consumidor da fila, o publisher da outbox e o w
 | Variável | Padrão | Efeito |
 |---|---|---|
 | `PORT` | `3000` | porta HTTP |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` ou `silent`; os logs saem em JSON, uma linha por evento |
 | `DATABASE_URL` | compose local | PostgreSQL |
 | `AWS_ENDPOINT_URL` | `http://localhost:4566` | LocalStack |
 | `SQS_CONSUMER_ENABLED` | `true` | liga o consumidor (`false` deixa só a API) |
@@ -58,6 +59,18 @@ A aplicação sobe a API HTTP, o consumidor da fila, o publisher da outbox e o w
 | `REFERENCE_WORKER_ENABLED` | `true` | liga o worker que reverifica as transações `PENDING_REFERENCE` |
 | `REFERENCE_WORKER_BATCH_SIZE` / `REFERENCE_WORKER_IDLE_DELAY_MS` | `20` / `1000` | transações por lote; espera quando não há vencidas |
 | `REFERENCE_CHECK_MAX_ATTEMPTS` | `15` | verificações até desistir com `REFERENCE_NOT_FOUND` (cerca de 9 min; use `3` para ver a desistência em ~7 s) |
+
+### Logs
+
+Cada linha é um objeto JSON com `time`, `level`, `context`, `message` e os ids da operação (`correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`). Com `jq` instalado:
+
+```bash
+bun run start | jq -c 'select(.level != "debug")'                      # tudo, sem debug
+bun run start | jq -c 'select(.correlationId == "demo-corr-1")'         # uma requisição (header X-Correlation-Id)
+bun run start | jq -c 'select(.message == "Wager transaction recorded") | {transactionId, status, failureCode}'
+```
+
+Linhas esperadas: `HTTP request` (uma por requisição), `Wager transaction recorded` (um desfecho novo), `Idempotent replay`, `Message failed, will retry` e `Message sent to the DLQ` (consumidor), `Wallet balance diverges from its ledger` (reconciliação). Os detalhes estão no `ARCHITECTURE.md` §12.
 
 ## 4. Testes automatizados
 

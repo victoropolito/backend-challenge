@@ -1,4 +1,5 @@
-import { Catch, HttpException, Logger, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
+import { Catch, HttpException, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common';
+import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { DomainError } from '../domain/shared/domain-error';
 import { isTransientDatabaseError } from '../infrastructure/database/transient-error';
 import type { HttpRequest, HttpResponse } from './http-types';
@@ -65,7 +66,7 @@ export function toErrorResponse(exception: unknown): ErrorResponse {
 /** Filtro global: corpo `{ code, message, retryable, details?, correlationId }`; erros repetíveis incluem `Retry-After`. */
 @Catch()
 export class HttpErrorFilter implements ExceptionFilter {
-  private readonly logger = new Logger('HttpError');
+  private readonly logger = new StructuredLogger('HttpError');
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
@@ -75,8 +76,15 @@ export class HttpErrorFilter implements ExceptionFilter {
 
     if (status >= 500) {
       this.logger.error(
-        `${request.method} ${request.originalUrl} -> ${status} ${body.code} [correlationId=${request.correlationId}]`,
-        exception instanceof Error ? exception.stack : String(exception),
+        'Request failed',
+        {
+          correlationId: request.correlationId,
+          method: request.method,
+          path: request.originalUrl.split('?')[0],
+          status,
+          code: body.code,
+        },
+        exception,
       );
     }
     if (response.headersSent) {

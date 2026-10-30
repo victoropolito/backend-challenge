@@ -9,6 +9,7 @@ import type { IdGenerator } from '../shared/id-generator';
 import type { TransactionRunner } from '../shared/transaction-runner';
 import { DEFAULT_REFERENCE_CHECK_POLICY } from './reference-check-policy';
 import type { EventOrigin, MissingReference, WagerTransactionProcessor } from './wager-transaction-processor';
+import type { WageringMonitor } from './wagering-monitor';
 
 export interface RecheckPendingReferencesDependencies {
   transactions: TransactionRunner;
@@ -22,6 +23,7 @@ export interface RecheckPendingReferencesDependencies {
   referenceCheckPolicy?: BackoffPolicy;
   /** Erros que não contam como tentativa: a transação continua vencida e é verificada de novo no próximo lote. */
   isTransientError?: (error: unknown) => boolean;
+  monitor?: WageringMonitor;
 }
 
 export interface RecheckPendingReferencesResult {
@@ -107,13 +109,17 @@ export class RecheckPendingReferencesUseCase {
     });
   }
 
-  /** Trava a wallet, relê a transação e só segue se ela ainda estiver PENDING_REFERENCE e vencida. */
-  private withLockedTransaction(
+  /**
+   * Trava a wallet, relê a transação e só segue se ela ainda estiver PENDING_REFERENCE e vencida. Depois do commit,
+   * informa o novo estado ao monitor.
+   */
+  private async withLockedTransaction(
     candidate: WagerTransaction,
     work: (transaction: WagerTransaction, wallet: Wallet | undefined, origin: EventOrigin) => Promise<Outcome>,
   ): Promise<Outcome> {
     const { transactions, wallets, wagerTransactions, clock, ids } = this.deps;
-    return transactions.run(async () => {
+    let changed: WagerTransaction | undefined;
+    const outcome = await transactions.run(async (): Promise<Outcome> => {
       const wallet = await wallets.findByIdForUpdate(candidate.walletId);
       const transaction = await wagerTransactions.findById(candidate.id);
       const now = clock.now();
@@ -124,8 +130,13 @@ export class RecheckPendingReferencesUseCase {
       ) {
         return 'skipped';
       }
+      changed = transaction;
       return work(transaction, wallet, { now, correlationId: ids.next(), causationId: transaction.id });
     });
+    if (changed !== undefined) {
+      this.deps.monitor?.recorded(changed, 'RECHECK');
+    }
+    return outcome;
   }
 
   private nextCheck(transaction: WagerTransaction, now: Date): Date {

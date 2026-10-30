@@ -1,7 +1,8 @@
-import { Inject, Logger, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap } from '@nestjs/common';
+import { Inject, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap } from '@nestjs/common';
 import { ApplicationModule } from '../application/application.module';
 import { RecheckPendingReferencesUseCase } from '../application/wagering/recheck-pending-references.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { PendingReferenceWorker } from './pending-reference.worker';
 
 /** Liga o worker de PENDING_REFERENCE ao ciclo de vida da aplicação (se habilitado na config). */
@@ -15,7 +16,7 @@ export class PendingReferenceModule implements OnApplicationBootstrap, BeforeApp
   ) {
     this.worker = new PendingReferenceWorker({
       recheck,
-      logger: new Logger('PendingReferenceWorker'),
+      logger: new StructuredLogger('PendingReferenceWorker'),
       options: { batchSize: config.referenceWorker.batchSize, idleDelayMs: config.referenceWorker.idleDelayMs },
     });
   }

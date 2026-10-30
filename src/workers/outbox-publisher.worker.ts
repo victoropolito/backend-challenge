@@ -1,7 +1,6 @@
 import type { PublishOutboxUseCase } from '../application/messaging/publish-outbox.use-case';
-import { describeError, PollingLoop, type WorkerLogger } from './polling-loop';
-
-export type { WorkerLogger } from './polling-loop';
+import type { AppLogger } from '../infrastructure/observability/structured-logger';
+import { PollingLoop } from './polling-loop';
 
 export interface OutboxPublisherWorkerOptions {
   batchSize: number;
@@ -11,7 +10,7 @@ export interface OutboxPublisherWorkerOptions {
 
 export interface OutboxPublisherWorkerDependencies {
   publish: Pick<PublishOutboxUseCase, 'execute'>;
-  logger: WorkerLogger;
+  logger: AppLogger;
   options: OutboxPublisherWorkerOptions;
 }
 
@@ -30,12 +29,11 @@ export class OutboxPublisherWorker {
       tick: async () => {
         const result = await publish.execute(options.batchSize);
         for (const [id, reason] of result.failures) {
-          logger.warn(`Event ${id} not published, will retry: ${reason}`);
+          logger.warn('Event not published, will retry', { eventId: id, reason });
         }
         return result.claimed === options.batchSize && result.failures.size === 0;
       },
-      onError: (error) =>
-        logger.error(`Outbox batch failed: ${describeError(error)}`, error instanceof Error ? error.stack : undefined),
+      onError: (error) => logger.error('Outbox batch failed', undefined, error),
     });
   }
 

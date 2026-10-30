@@ -9,6 +9,7 @@ import {
   type SubmitWagerTransactionResult,
 } from '../../../src/application/wagering/submit-wager-transaction.use-case';
 import { WagerTransactionProcessor } from '../../../src/application/wagering/wager-transaction-processor';
+import { WageringMonitor, type WagerTransactionOrigin } from '../../../src/application/wagering/wagering-monitor';
 import { CreateWalletUseCase } from '../../../src/application/wallet/create-wallet.use-case';
 import { Money } from '../../../src/domain/shared/money';
 import { FailureCode } from '../../../src/domain/wagering/failure-code';
@@ -18,6 +19,7 @@ import {
   WagerTransactionStatus as Status,
 } from '../../../src/domain/wagering/wager-transaction';
 import type { Wallet } from '../../../src/domain/wallet/wallet';
+import type { WagerTransaction } from '../../../src/domain/wagering/wager-transaction';
 import { MikroOrmTransactionRunner } from '../../../src/infrastructure/database/mikro-orm-transaction-runner';
 import {
   MikroOrmInboxRepository,
@@ -34,6 +36,33 @@ import { createTestDatabase, type TestDatabase } from '../support/test-database'
 let db: TestDatabase;
 let submitUseCase: SubmitWagerTransactionUseCase;
 let createWalletUseCase: CreateWalletUseCase;
+let monitoredSubmit: SubmitWagerTransactionUseCase;
+let brokenSubmit: SubmitWagerTransactionUseCase;
+let racySubmit: SubmitWagerTransactionUseCase;
+
+/** Simula uma submissão idêntica confirmada entre a leitura pela idempotency key e a leitura pelo externalTransactionId. */
+class RacyWagerTransactionRepository extends MikroOrmWagerTransactionRepository {
+  missNextKeyLookup = false;
+
+  override async findByIdempotencyKey(providerId: string, idempotencyKey: string) {
+    if (this.missNextKeyLookup) {
+      this.missNextKeyLookup = false;
+      return undefined;
+    }
+    return super.findByIdempotencyKey(providerId, idempotencyKey);
+  }
+}
+let racyRepository: RacyWagerTransactionRepository;
+
+const monitor = new (class extends WageringMonitor {
+  readonly calls: [string, string, WagerTransactionOrigin | undefined][] = [];
+  recorded(transaction: WagerTransaction, origin: WagerTransactionOrigin): void {
+    this.calls.push(['recorded', transaction.externalTransactionId, origin]);
+  }
+  replayed(transaction: WagerTransaction): void {
+    this.calls.push(['replayed', transaction.externalTransactionId, undefined]);
+  }
+})();
 
 const clock = new (class extends Clock {
   current = new Date('2026-10-30T12:00:00.000Z');
@@ -55,6 +84,30 @@ beforeAll(async () => {
   const inbox = new MikroOrmInboxRepository(em);
   submitUseCase = new SubmitWagerTransactionUseCase({ transactions, wallets, wagerTransactions, processor, inbox, clock, ids });
   createWalletUseCase = new CreateWalletUseCase({ transactions, wallets, ledger, wagerTransactions, outbox, clock, ids });
+  monitoredSubmit = new SubmitWagerTransactionUseCase({
+    transactions, wallets, wagerTransactions, processor, inbox, clock, ids, monitor,
+  });
+  racyRepository = new RacyWagerTransactionRepository(em);
+  racySubmit = new SubmitWagerTransactionUseCase({
+    transactions,
+    wallets,
+    wagerTransactions: racyRepository,
+    processor,
+    inbox,
+    clock,
+    ids,
+  });
+  const failingOutbox = Object.assign(Object.create(outbox), { insert: () => Promise.reject(new Error('outbox down')) });
+  brokenSubmit = new SubmitWagerTransactionUseCase({
+    transactions,
+    wallets,
+    wagerTransactions,
+    processor: new WagerTransactionProcessor({ wallets, ledger, wagerTransactions, outbox: failingOutbox, ids }),
+    inbox,
+    clock,
+    ids,
+    monitor,
+  });
 }, 30_000);
 
 afterAll(async () => {
@@ -386,6 +439,21 @@ describe('SubmitWagerTransactionUseCase', () => {
   });
 
   describe('idempotency', () => {
+    it('a submission committed between the key lookup and the external id lookup is still a replay', async () => {
+      const wallet = await openWallet('100.00');
+      const bet = command(wallet);
+      await submitUseCase.execute(bet);
+
+      racyRepository.missNextKeyLookup = true;
+      const replay = await racySubmit.execute(bet);
+
+      expect(replay.idempotentReplay).toBe(true);
+      expect(replay.transaction.status).toBe(Status.Processed);
+      racyRepository.missNextKeyLookup = true;
+      await expect(racySubmit.execute({ ...bet, money: brl('1.00') })).rejects.toBeInstanceOf(IdempotencyConflictError);
+      expect((await storedWallet(wallet.id)).balance).toEqual(brl('75.00'));
+    });
+
     it('replays the original result, including the balance observed back then', async () => {
       const wallet = await openWallet('100.00');
       const original = command(wallet, { money: brl('30.00') });
@@ -531,6 +599,37 @@ describe('SubmitWagerTransactionUseCase', () => {
       for (const wallet of wallets) {
         expect((await storedWallet(wallet.id)).balance).toEqual(brl('10.00'));
       }
+    });
+  });
+
+  describe('monitor', () => {
+    it('reports a new outcome after the commit and a repeated submission as a replay', async () => {
+      const wallet = await openWallet('100.00');
+      const bet = command(wallet);
+      monitor.calls.length = 0;
+
+      await monitoredSubmit.execute(bet);
+      await monitoredSubmit.execute(bet);
+      await monitoredSubmit.execute(command(wallet, { money: brl('500.00') }));
+
+      expect(monitor.calls.map(([call, externalId, origin]) => [call, externalId === bet.externalTransactionId, origin])).toEqual([
+        ['recorded', true, 'SUBMISSION'],
+        ['replayed', true, undefined],
+        ['recorded', false, 'SUBMISSION'],
+      ]);
+    });
+
+    it('reports nothing when the submission is rolled back or conflicts', async () => {
+      const wallet = await openWallet('100.00');
+      const bet = command(wallet);
+      monitor.calls.length = 0;
+
+      await expect(brokenSubmit.execute(bet)).rejects.toThrow('outbox down');
+      await monitoredSubmit.execute(bet);
+      monitor.calls.length = 0;
+      await expect(monitoredSubmit.execute({ ...bet, money: brl('1.00') })).rejects.toBeInstanceOf(IdempotencyConflictError);
+
+      expect(monitor.calls).toEqual([]);
     });
   });
 });

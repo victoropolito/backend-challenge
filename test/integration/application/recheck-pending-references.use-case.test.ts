@@ -11,6 +11,7 @@ import {
   type SubmitWagerTransactionCommand,
 } from '../../../src/application/wagering/submit-wager-transaction.use-case';
 import { WagerTransactionProcessor } from '../../../src/application/wagering/wager-transaction-processor';
+import { WageringMonitor, type WagerTransactionOrigin } from '../../../src/application/wagering/wagering-monitor';
 import { CreateWalletUseCase } from '../../../src/application/wallet/create-wallet.use-case';
 import { Money } from '../../../src/domain/shared/money';
 import { FailureCode } from '../../../src/domain/wagering/failure-code';
@@ -32,7 +33,7 @@ import {
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { PendingReferenceWorker } from '../../../src/workers/pending-reference.worker';
-import type { WorkerLogger } from '../../../src/workers/polling-loop';
+import { silentLogger } from '../../support/loggers';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 
 const MAX_ATTEMPTS = 3;
@@ -359,9 +360,34 @@ describe('RecheckPendingReferencesUseCase', () => {
   });
 });
 
-describe('PendingReferenceWorker', () => {
-  const silentLogger: WorkerLogger = { log() {}, warn() {}, error() {} };
+describe('RecheckPendingReferencesUseCase monitor', () => {
+  it('reports each new state after the commit, and nothing for a skipped transaction', async () => {
+    const calls: [string, Status, WagerTransactionOrigin][] = [];
+    const monitored = recheckWith({
+      monitor: new (class extends WageringMonitor {
+        recorded(transaction: WagerTransaction, origin: WagerTransactionOrigin): void {
+          calls.push([transaction.id, transaction.status, origin]);
+        }
+        replayed(): void {}
+      })(),
+    });
+    const wallet = await openWallet('100.00');
+    const betId = randomUUID();
+    const waiting = await referencing(wallet, Kind.Win, randomUUID());
+    const resolved = await referencing(wallet, Kind.Win, betId);
+    await submit(wallet, { externalTransactionId: betId });
 
+    later();
+    await drain(monitored);
+    await drain(monitored);
+
+    expect(calls).toContainEqual([waiting.id, Status.PendingReference, 'RECHECK']);
+    expect(calls).toContainEqual([resolved.id, Status.Processed, 'RECHECK']);
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('PendingReferenceWorker', () => {
   it('applies a waiting transaction shortly after its reference arrives, and stops promptly', async () => {
     const wallet = await openWallet('100.00');
     const betId = randomUUID();

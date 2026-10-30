@@ -1,5 +1,6 @@
 import type { RecheckPendingReferencesUseCase } from '../application/wagering/recheck-pending-references.use-case';
-import { describeError, PollingLoop, type WorkerLogger } from './polling-loop';
+import type { AppLogger } from '../infrastructure/observability/structured-logger';
+import { PollingLoop } from './polling-loop';
 
 export interface PendingReferenceWorkerOptions {
   batchSize: number;
@@ -9,7 +10,7 @@ export interface PendingReferenceWorkerOptions {
 
 export interface PendingReferenceWorkerDependencies {
   recheck: Pick<RecheckPendingReferencesUseCase, 'execute'>;
-  logger: WorkerLogger;
+  logger: AppLogger;
   options: PendingReferenceWorkerOptions;
 }
 
@@ -28,18 +29,11 @@ export class PendingReferenceWorker {
       tick: async () => {
         const result = await recheck.execute(options.batchSize);
         for (const [id, error] of result.errors) {
-          logger.error(
-            `Recheck of pending reference transaction ${id} failed: ${describeError(error)}`,
-            error instanceof Error ? error.stack : undefined,
-          );
+          logger.error('Pending reference recheck failed', { transactionId: id }, error);
         }
         return result.due === options.batchSize && result.errors.size === 0;
       },
-      onError: (error) =>
-        logger.error(
-          `Pending reference batch failed: ${describeError(error)}`,
-          error instanceof Error ? error.stack : undefined,
-        ),
+      onError: (error) => logger.error('Pending reference batch failed', undefined, error),
     });
   }
 

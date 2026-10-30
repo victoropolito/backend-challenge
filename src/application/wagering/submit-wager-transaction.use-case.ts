@@ -20,6 +20,7 @@ import { isUuid } from '../shared/uuid';
 import { DEFAULT_REFERENCE_CHECK_POLICY } from './reference-check-policy';
 import { wagerPayloadHash } from './wager-payload-hash';
 import type { WagerTransactionProcessor } from './wager-transaction-processor';
+import type { WageringMonitor } from './wagering-monitor';
 
 export interface SubmitWagerTransactionCommand {
   idempotencyKey: string;
@@ -53,6 +54,7 @@ export interface SubmitWagerTransactionDependencies {
   clock: Clock;
   ids: IdGenerator;
   referenceCheckPolicy?: BackoffPolicy;
+  monitor?: WageringMonitor;
 }
 
 /** A idempotency key já foi usada pelo provider com outro payload. */
@@ -89,6 +91,16 @@ export class SubmitWagerTransactionUseCase {
   constructor(private readonly deps: SubmitWagerTransactionDependencies) {}
 
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmitWagerTransactionResult> {
+    const result = await this.submit(command);
+    if (result.idempotentReplay) {
+      this.deps.monitor?.replayed(result.transaction);
+    } else {
+      this.deps.monitor?.recorded(result.transaction, 'SUBMISSION');
+    }
+    return result;
+  }
+
+  private async submit(command: SubmitWagerTransactionCommand): Promise<SubmitWagerTransactionResult> {
     const { transactions, wallets, processor, clock, ids } = this.deps;
     const now = clock.now();
 
@@ -147,21 +159,32 @@ export class SubmitWagerTransactionUseCase {
     }
   }
 
-  /** Submissão anterior com a mesma idempotency key (replay ou conflito) ou com o mesmo externalTransactionId (conflito). */
+  /**
+   * Submissão anterior com a mesma idempotency key (replay ou conflito) ou com o mesmo externalTransactionId (conflito).
+   * As duas leituras não são atômicas: uma submissão idêntica confirmada entre elas aparece só na segunda, e é
+   * reconhecida pela mesma idempotency key.
+   */
   private async findPrevious(transaction: WagerTransaction): Promise<SubmitWagerTransactionResult | undefined> {
     const { wagerTransactions } = this.deps;
     const sameKey = await wagerTransactions.findByIdempotencyKey(transaction.providerId, transaction.idempotencyKey);
     if (sameKey !== undefined) {
-      if (!sameKey.matchesPayload(transaction.payloadHash)) {
-        throw new IdempotencyConflictError(transaction.providerId, transaction.idempotencyKey, sameKey.id);
-      }
-      return { transaction: sameKey, idempotentReplay: true };
+      return this.replayOf(sameKey, transaction);
     }
     const sameExternalId = await wagerTransactions.findByExternalId(transaction.providerId, transaction.externalTransactionId);
     if (sameExternalId !== undefined) {
+      if (sameExternalId.idempotencyKey === transaction.idempotencyKey) {
+        return this.replayOf(sameExternalId, transaction);
+      }
       throw new ExternalTransactionIdConflictError(transaction.providerId, transaction.externalTransactionId, sameExternalId.id);
     }
     return undefined;
+  }
+
+  private replayOf(previous: WagerTransaction, transaction: WagerTransaction): SubmitWagerTransactionResult {
+    if (!previous.matchesPayload(transaction.payloadHash)) {
+      throw new IdempotencyConflictError(transaction.providerId, transaction.idempotencyKey, previous.id);
+    }
+    return { transaction: previous, idempotentReplay: true };
   }
 
   /** Grava a mensagem de origem como processada; lança DuplicateInboxMessageError se ela já foi registrada. */

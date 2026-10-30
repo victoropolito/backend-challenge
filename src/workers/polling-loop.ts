@@ -1,9 +1,3 @@
-export interface WorkerLogger {
-  log(message: string): void;
-  warn(message: string): void;
-  error(message: string, stack?: string): void;
-}
-
 export interface PollingLoopOptions {
   /** Executa um lote; retorna true quando provavelmente há mais trabalho e o próximo lote deve começar já. */
   tick(): Promise<boolean>;
@@ -61,8 +55,4 @@ export class PollingLoop {
       this.wakeUp = done;
     });
   }
-}
-
-export function describeError(error: unknown): string {
-  return error instanceof Error ? error.message || error.name : String(error);
 }

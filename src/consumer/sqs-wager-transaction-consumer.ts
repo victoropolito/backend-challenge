@@ -9,14 +9,10 @@ import {
 import type { Clock } from '../application/shared/clock';
 import type { ConsumeWagerTransactionMessageUseCase } from '../application/wagering/consume-wager-transaction-message.use-case';
 import { exponentialBackoffDelayMs, type BackoffPolicy } from '../domain/shared/backoff';
+import { addLogContext, withLogContext } from '../infrastructure/observability/log-context';
+import type { AppLogger } from '../infrastructure/observability/structured-logger';
 import { classifyMessageFailure, messageFailureCode, type MessageFailureKind } from './message-failure';
 import { parseWagerTransactionMessage } from './wager-transaction-message';
-
-export interface ConsumerLogger {
-  log(message: string): void;
-  warn(message: string): void;
-  error(message: string, stack?: string): void;
-}
 
 export interface SqsWagerTransactionConsumerOptions {
   queueUrl: string;
@@ -34,7 +30,7 @@ export interface SqsWagerTransactionConsumerDependencies {
   sqs: SQSClient;
   handler: Pick<ConsumeWagerTransactionMessageUseCase, 'execute'>;
   clock: Clock;
-  logger: ConsumerLogger;
+  logger: AppLogger;
   options: SqsWagerTransactionConsumerOptions;
 }
 
@@ -76,18 +72,18 @@ export class SqsWagerTransactionConsumer {
     }
     this.running = false;
     this.wakeUp?.();
-    this.deps.logger.log(`Stopping: ${this.inFlight.size} message(s) in progress`);
+    this.deps.logger.info('Stopping', { inFlight: this.inFlight.size });
     const finished = await settlesWithin(this.loop!, this.deps.options.shutdownTimeoutMs);
     if (!finished) {
       const pending = [...this.inFlight.values()];
-      this.deps.logger.warn(`Shutdown timeout reached; releasing ${pending.length} in-flight message(s)`);
+      this.deps.logger.warn('Shutdown timeout reached; releasing in-flight messages', { released: pending.length });
       for (const message of pending) {
         this.abandoned.add(message.ReceiptHandle!);
       }
       await Promise.all(pending.map((message) => this.release(message)));
       return;
     }
-    this.deps.logger.log('Stopped: messages in progress were finished');
+    this.deps.logger.info('Stopped: messages in progress were finished');
   }
 
   private async run(): Promise<void> {
@@ -113,7 +109,7 @@ export class SqsWagerTransactionConsumer {
       );
       return response.Messages ?? [];
     } catch (error) {
-      logger.warn(`Receive from ${options.queueUrl} failed: ${describeError(error)}`);
+      logger.warn('Receive failed', { queueUrl: options.queueUrl, reason: describeError(error) });
       await this.pause(RECEIVE_ERROR_PAUSE_MS);
       return [];
     }
@@ -135,8 +131,14 @@ export class SqsWagerTransactionConsumer {
         await Promise.all(messages.slice(index).map((rest) => this.release(rest)));
         return;
       }
-      const outcome = await this.track(message, () => this.process(message));
-      await this.settle(message, outcome);
+      const outcome = await withLogContext(
+        { sqsMessageId: message.MessageId, receiveCount: receiveCount(message) },
+        async () => {
+          const decided = await this.track(message, () => this.process(message));
+          await this.settle(message, decided);
+          return decided;
+        },
+      );
       if (outcome.action === 'retry') {
         await Promise.all(messages.slice(index + 1).map((rest) => this.release(rest)));
         return;
@@ -158,6 +160,13 @@ export class SqsWagerTransactionConsumer {
     const attempt = receiveCount(message);
     try {
       const parsed = parseWagerTransactionMessage(message.Body ?? '', clock.now());
+      addLogContext({
+        messageId: parsed.messageId,
+        correlationId: parsed.command.correlationId,
+        providerId: parsed.command.providerId,
+        walletId: parsed.command.walletId,
+        externalTransactionId: parsed.command.externalTransactionId,
+      });
       await handler.execute(parsed);
       return { action: 'ack' };
     } catch (error) {
@@ -173,7 +182,6 @@ export class SqsWagerTransactionConsumer {
   /** Executa no SQS a decisão tomada; se o SQS falhar aqui, a mensagem volta sozinha e é reprocessada com segurança. */
   private async settle(message: Message, outcome: Outcome): Promise<void> {
     const { logger } = this.deps;
-    const id = message.MessageId;
     if (this.abandoned.delete(message.ReceiptHandle!)) {
       return;
     }
@@ -181,20 +189,23 @@ export class SqsWagerTransactionConsumer {
       switch (outcome.action) {
         case 'ack':
           await this.delete(message);
+          logger.debug('Message acknowledged');
           return;
         case 'retry':
-          logger.warn(
-            `Message ${id} failed (attempt ${receiveCount(message)}): ${describeError(outcome.error)}; retrying in ${outcome.delaySeconds}s`,
-          );
+          logger.warn('Message failed, will retry', {
+            failureCode: messageFailureCode(outcome.error),
+            reason: describeError(outcome.error),
+            retryInSeconds: outcome.delaySeconds,
+          });
           await this.changeVisibility(message, outcome.delaySeconds);
           return;
         case 'dead-letter':
-          logFailure(logger, `Message ${id} sent to the DLQ (${outcome.kind}): ${describeError(outcome.error)}`, outcome);
+          logDeadLetter(logger, outcome);
           await this.deadLetter(message, outcome);
           return;
       }
     } catch (error) {
-      logger.warn(`Could not ${outcome.action} message ${id}: ${describeError(error)}`);
+      logger.warn('Could not settle message', { action: outcome.action, reason: describeError(error) });
     }
   }
 
@@ -240,7 +251,7 @@ export class SqsWagerTransactionConsumer {
     try {
       await this.changeVisibility(message, 0);
     } catch (error) {
-      this.deps.logger.warn(`Could not release message ${message.MessageId}: ${describeError(error)}`);
+      this.deps.logger.warn('Could not release message', { sqsMessageId: message.MessageId, reason: describeError(error) });
     }
   }
 
@@ -281,10 +292,12 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
-function logFailure(logger: ConsumerLogger, message: string, outcome: { kind: MessageFailureKind; error: unknown }): void {
+/** Falha permanente é aviso (problema da mensagem); tentativas esgotadas são erro, com a stack. */
+function logDeadLetter(logger: AppLogger, outcome: { kind: MessageFailureKind; error: unknown }): void {
+  const fields = { failureKind: outcome.kind, failureCode: messageFailureCode(outcome.error), reason: describeError(outcome.error) };
   if (outcome.kind === 'PERMANENT') {
-    logger.warn(message);
+    logger.warn('Message sent to the DLQ', fields);
   } else {
-    logger.error(message, outcome.error instanceof Error ? outcome.error.stack : undefined);
+    logger.error('Message sent to the DLQ', fields, outcome.error);
   }
 }

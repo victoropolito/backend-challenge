@@ -11,10 +11,10 @@ import { WagerTransactionProcessor } from '../../../src/application/wagering/wag
 import { CreateWalletUseCase } from '../../../src/application/wallet/create-wallet.use-case';
 import {
   SqsWagerTransactionConsumer,
-  type ConsumerLogger,
   type SqsWagerTransactionConsumerOptions,
 } from '../../../src/consumer/sqs-wager-transaction-consumer';
 import { parseWagerTransactionMessage } from '../../../src/consumer/wager-transaction-message';
+import { silentLogger } from '../../support/loggers';
 import { Money } from '../../../src/domain/shared/money';
 import type { Wallet } from '../../../src/domain/wallet/wallet';
 import { MikroOrmTransactionRunner } from '../../../src/infrastructure/database/mikro-orm-transaction-runner';
@@ -45,8 +45,6 @@ const clock = new (class extends Clock {
     return new Date();
   }
 })();
-
-const silentLogger: ConsumerLogger = { log() {}, warn() {}, error() {} };
 
 beforeAll(async () => {
   db = await createTestDatabase();

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import type { WalletReconciliation } from '../../../src/application/wallet/reconcile-wallet.use-case';
 import { Money } from '../../../src/domain/shared/money';
 import { LoggingReconciliationMonitor } from '../../../src/infrastructure/observability/logging-reconciliation-monitor';
+import { RecordingLogger } from '../../support/loggers';
 
 const brl = (amount: string) => Money.rehydrate({ amount, currency: 'BRL' });
 
@@ -20,18 +21,29 @@ const reconciliation = (stored: string, calculated: string): WalletReconciliatio
 
 describe('LoggingReconciliationMonitor', () => {
   it('logs a divergence with both balances and the difference', () => {
-    const warnings: string[] = [];
-    new LoggingReconciliationMonitor({ warn: (message) => warnings.push(message) }).reconciled(reconciliation('90.00', '100.00'));
+    const logger = new RecordingLogger();
+    new LoggingReconciliationMonitor(logger).reconciled(reconciliation('90.00', '100.00'));
 
-    expect(warnings).toEqual([
-      'Wallet wallet-1 balance diverges from its ledger: stored 90.00 BRL, calculated 100.00 BRL, difference -10.00 BRL, 3 entries checked',
+    expect(logger.entries).toEqual([
+      {
+        level: 'warn',
+        message: 'Wallet balance diverges from its ledger',
+        fields: {
+          walletId: 'wallet-1',
+          storedBalance: '90.00',
+          calculatedBalance: '100.00',
+          difference: '-10.00',
+          currency: 'BRL',
+          checkedEntries: 3,
+        },
+      },
     ]);
   });
 
   it('stays quiet when the wallet is consistent', () => {
-    const warnings: string[] = [];
-    new LoggingReconciliationMonitor({ warn: (message) => warnings.push(message) }).reconciled(reconciliation('100.00', '100.00'));
+    const logger = new RecordingLogger();
+    new LoggingReconciliationMonitor(logger).reconciled(reconciliation('100.00', '100.00'));
 
-    expect(warnings).toEqual([]);
+    expect(logger.entries).toEqual([]);
   });
 });

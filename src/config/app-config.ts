@@ -1,8 +1,10 @@
 import { z } from 'zod';
+import { LOG_LEVELS, type LogLevelName } from '../infrastructure/observability/structured-logger';
 
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
+  LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
 
   DATABASE_URL: z.url(),
   DATABASE_POOL_MAX: z.coerce.number().int().positive().default(10),
@@ -39,6 +41,7 @@ const EnvSchema = z.object({
 export interface AppConfig {
   readonly nodeEnv: 'development' | 'test' | 'production';
   readonly port: number;
+  readonly logLevel: LogLevelName;
   readonly database: {
     readonly url: string;
     readonly poolMax: number;
@@ -100,6 +103,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     nodeEnv: e.NODE_ENV,
     port: e.PORT,
+    logLevel: e.LOG_LEVEL,
     database: { url: e.DATABASE_URL, poolMax: e.DATABASE_POOL_MAX },
     aws: {
       region: e.AWS_REGION,

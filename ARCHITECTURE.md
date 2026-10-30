@@ -16,7 +16,7 @@ src/
 ├── infrastructure/
 │   ├── database/           MikroORM: config, migrations, records (EntitySchema), repositórios
 │   ├── messaging/          cliente SQS e publisher de eventos (SqsEventPublisher)
-│   ├── observability/      monitor de reconciliação (log de divergências)
+│   ├── observability/      logs JSON (StructuredLogger, contexto, adaptador do NestJS) e monitores de transações e reconciliação
 │   └── system/             relógio do sistema e gerador de UUIDv7
 ├── contracts/              schemas Zod de entrada compartilhados pela API e pelo consumidor
 ├── http/                   controllers, validação (Zod), correlation id, filtro de erros
@@ -125,6 +125,7 @@ Todo `REJECTED`/`FAILED` carrega um código estável:
   3. Abre a transação SQL e trava a wallet (`SELECT ... FOR UPDATE`). **Repete a verificação de idempotência já com o lock**: uma submissão idêntica concorrente na mesma wallet terá sido confirmada antes, e esta vira replay.
   4. `WagerTransactionProcessor` decide e grava tudo na mesma transação: transação, lançamento, saldo (`update` com verificação de versão) e eventos na outbox. Quando a submissão vem da fila, a mensagem de origem é gravada na inbox nessa mesma transação (seção 8.2).
   5. Se mesmo assim o insert colidir na unicidade (concorrência sem lock comum, por exemplo com uma wallet inexistente), a transação é desfeita e a submissão anterior é relida: vira replay ou conflito, nunca duplicação.
+  - As duas leituras da verificação (por idempotency key e por `externalTransactionId`) não são atômicas. Uma submissão idêntica confirmada entre elas aparece só na segunda; por isso, um registro com o mesmo `externalTransactionId` **e a mesma idempotency key** é tratado como a mesma submissão (replay ou conflito de payload), e não como `EXTERNAL_TRANSACTION_ID_CONFLICT`.
 - **Ordem das regras no processor:** wallet inexistente (`WALLET_NOT_FOUND`) → wallet de outro jogador (`WALLET_PLAYER_MISMATCH`) → moeda (`CURRENCY_MISMATCH`) → referência (ausente ⇒ `PENDING_REFERENCE`; senão `checkReference`) → reversão única (`REFERENCE_ALREADY_REVERSED`) → saldo (`INSUFFICIENT_BALANCE` para `BET`, `REVERSAL_INSUFFICIENT_BALANCE` para `ROLLBACK` que debitaria) → aplica. Toda rejeição é gravada (auditável e idempotente) e gera `WagerTransactionRejected`.
 - O processor é separado do caso de uso para ser reutilizado pelo worker de `PENDING_REFERENCE`: ele aceita uma transação nova (`PENDING`, inserida) ou já gravada (`PENDING_REFERENCE`, atualizada), e quem chama decide o que fazer quando a referência continua ausente (`onMissingReference`, que recebe a referência encontrada, se ela existe mas ainda espera, e o saldo do momento). Na submissão, a primeira verificação fica agendada para `agora + 1 s`; as seguintes, e o limite, são do worker (seção 10).
 - Quando uma transação termina (`PROCESSED`, `REJECTED` ou `FAILED`), o processor antecipa para agora a próxima verificação das transações `PENDING_REFERENCE` da mesma wallet que esperam por ela (`scheduleReferenceChecksFor`), na mesma transação SQL. Assim, quem chegou antes da referência é aplicado no próximo ciclo do worker, e não só no fim do backoff.
@@ -377,7 +378,34 @@ Configuração: `REFERENCE_WORKER_ENABLED`, `REFERENCE_WORKER_BATCH_SIZE` (20), 
 - **Na prática, uma divergência só aparece se as garantias do banco forem contornadas.** A constraint trigger `wallet_balance_ledger_check` (seção 4.2) recusa no commit qualquer transação que deixe o saldo diferente do último `balance_after`. Uma divergência exige desligar o trigger, uma escrita com privilégio de superusuário (`session_replication_role = replica`) ou uma restauração parcial. A reconciliação é a verificação independente dessa garantia, e os testes a provocam desligando o trigger.
 - `checkedAt` é um campo a mais em relação ao exemplo do enunciado.
 
-## 12. Interpretações adotadas
+## 12. Observabilidade
+
+### 12.1 Logs estruturados
+
+Toda saída da aplicação, inclusive a do próprio NestJS (`NestJsonLogger`), é **uma linha JSON por evento** no stdout:
+
+```json
+{"time":"2026-10-30T19:13:57.925Z","level":"info","context":"Wagering","message":"Wager transaction recorded",
+ "sqsMessageId":"7d7c…","receiveCount":1,"messageId":"msg-12964","correlationId":"msg-12964","providerId":"provider-a",
+ "walletId":"01a1…","externalTransactionId":"bet-26927","transactionId":"01a1…","kind":"BET","status":"PROCESSED","origin":"SUBMISSION"}
+```
+
+- **Campos padronizados:** `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`, sempre com esses nomes, além de `time`, `level` (`debug`, `info`, `warn`, `error`), `context` (componente) e `message` (texto fixo, filtrável). Os detalhes vão em campos próprios, nunca interpolados no texto. Erros levam `error: { name, message, stack }`.
+- **Contexto propagado** (`withLogContext`, sobre `AsyncLocalStorage`): toda linha emitida durante uma requisição HTTP carrega o `correlationId`. Durante o processamento de uma mensagem da fila, as linhas carregam `sqsMessageId` e `receiveCount` e, depois da leitura do corpo, `messageId`, `correlationId`, `providerId`, `walletId` e `externalTransactionId`. Isso vale também para os logs de retry e de DLQ dessa mensagem.
+- **Desfechos de transação:** os casos de uso informam a porta `WageringMonitor` **depois do commit**, então o log nunca registra algo que foi desfeito. O monitor registra cada desfecho novo (`Wager transaction recorded`, com `status`, `failureCode` e `origin` = `SUBMISSION`/`RECHECK`) e cada replay (`Idempotent replay`). `FAILED` sai como `error`; a reverificação que continua esperando sai como `debug`.
+- **HTTP:** uma linha por requisição (`HTTP request`: método, caminho sem query string, status, `durationMs`, `correlationId`); os health checks saem em `debug`, para não poluir. Respostas 5xx geram também `Request failed`, com o erro.
+- **Sem dados sensíveis:** não vão para o log corpos de requisição ou de mensagem, valores, saldos nem `playerId`; as transações aparecem só pelos ids, tipo e status. A única exceção são as divergências de reconciliação, que registram os saldos comparados, porque sem eles a divergência não é diagnosticável.
+- `LOG_LEVEL` (`debug`, `info`, `warn`, `error`, `silent`; padrão `info`). Os testes sobem a aplicação com `silent`.
+
+### 12.2 Health checks
+
+`GET /health/live` (processo vivo) e `GET /health/ready` (PostgreSQL e as filas alcançáveis, com timeout de 2 s por dependência; 503 quando algo está fora), sem autenticação.
+
+### 12.3 Métricas
+
+**Planejado.** As portas `WageringMonitor` e `ReconciliationMonitor` já recebem os desfechos e as divergências; as métricas (transações por status, duplicatas, retries, DLQ, conflitos de lock, atraso da outbox, latência) serão alimentadas por elas e pelos adaptadores (consumidor, publisher).
+
+## 13. Interpretações adotadas
 
 | Tema | Interpretação | Motivo |
 |---|---|---|
@@ -394,7 +422,7 @@ Configuração: `REFERENCE_WORKER_ENABLED`, `REFERENCE_WORKER_BATCH_SIZE` (20), 
 | Mesmo `externalTransactionId` com outra idempotency key | Conflito, não replay | O header é a fonte da verdade da idempotência |
 | Moeda | Escala 2 para qualquer moeda; o desafio usa `BRL`, mas o modelo é multi-moeda | Simplificação permitida pelo enunciado |
 
-## 13. Limitações conhecidas
+## 14. Limitações conhecidas
 
 - **Ordem dos eventos entre publishers:** um lote é publicado na ordem de gravação, mas dois publishers podem pegar eventos consecutivos do mesmo agregado em lotes diferentes, e o segundo lote pode chegar antes. Os consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e `occurredAt` para ordenar, e não a ordem de chegada.
 - Linhas publicadas da outbox não são apagadas: a tabela cresce sem limite. Uma rotina de limpeza (apagar publicadas com mais de N dias) fica para depois.
@@ -407,13 +435,14 @@ Configuração: `REFERENCE_WORKER_ENABLED`, `REFERENCE_WORKER_BATCH_SIZE` (20), 
 - A imutabilidade do ledger é garantida por trigger, que vale para qualquer role. Restringir permissões por role no banco (aplicação sem `UPDATE`/`DELETE`) ficou de fora, porque o ambiente local usa um único usuário.
 - Ledger de partidas simples (sem conta de contrapartida da casa).
 - Um `WIN` que referencia uma `BET` já reembolsada ainda é aceito: a regra de reversão única cobre só `REFUND`/`ROLLBACK`.
+- Os logs vão só para o stdout; a coleta e a retenção ficam com a plataforma (Docker, agente de logs). As mensagens de erro inesperado (`error.message`) entram no log como vieram, e mensagens de bibliotecas podem trazer detalhes do pedido.
 - A reconciliação é sob demanda, uma wallet por chamada. Não há rotina periódica que percorra todas as wallets, nem histórico das reconciliações (o resultado só vai para a resposta e para o log).
 - `FAILED`/`PROCESSING_ERROR` só é produzido pelo worker de `PENDING_REFERENCE`. Na submissão, erros de infraestrutura desfazem a transação SQL inteira e são repetidos (HTTP 503 ou nova entrega da fila); ver a seção 8.3.
 - Uma transação rejeitada com `REFERENCE_NOT_FOUND` não é revivida se a referência chegar depois: o provider precisa reenviá-la com outra idempotency key (a mesma chave devolve a rejeição original).
 - Instâncias diferentes do worker de `PENDING_REFERENCE` podem buscar os mesmos candidatos e se serializar no lock da wallet: a segunda só descobre que a transação já foi tratada. É trabalho repetido, sem efeito na correção; com muitas pendentes, o ganho de mais instâncias é menor que no publisher da outbox, que divide o trabalho com `SKIP LOCKED`.
 - A antecipação da verificação vale só para transações da mesma wallet da referência; as de outra wallet seriam rejeitadas por `REFERENCE_MISMATCH` de qualquer forma, e isso acontece na próxima verificação agendada delas.
 
-## 14. Testes
+## 15. Testes
 
 - **Unitários** (`test/unit`): JSON canônico e hash do payload, `Money` (escala, entradas inválidas, conflito de moeda, ausência de arredondamento), invariantes da `Wallet`, máquina de estados e regras de referência da `WagerTransaction`, eventos, inbox, outbox e backoff.
 - **Unitários da API e do consumidor:** mapeamento de exceções para status, classificação de erros transitórios do banco, leitura e validação das mensagens da fila (hash independente da ordem das chaves, corpo inválido) e classificação de falhas (permanente, transitória, inesperada).
@@ -423,8 +452,10 @@ Configuração: `REFERENCE_WORKER_ENABLED`, `REFERENCE_WORKER_BATCH_SIZE` (20), 
 - **Outbox:** o caso de uso de publicação é testado no banco real com um publisher em memória: ordem de gravação, tamanho do lote, mensagens ainda não vencidas puladas, recusa parcial com backoff, destino fora do ar com nova tentativa depois, um segundo publisher pulando as linhas travadas pelo primeiro, 5 publishers concorrentes sobre 200 mensagens (cada uma publicada exatamente uma vez) e morte depois de publicar e antes do commit (republicação com o mesmo id). O `SqsEventPublisher` e o worker são testados no LocalStack real: formato da mensagem, deduplicação pelo `eventId`, fila inexistente, eventos gravados com nenhum publisher no ar sendo publicados depois, 3 workers simultâneos (cada evento recebido uma vez) e parada rápida. Mutações conferidas: sem a trava, há publicação duplicada; com `FOR UPDATE` sem `SKIP LOCKED`, os publishers ficam esperando uns pelos outros.
 - **`PENDING_REFERENCE`:** o caso de uso de reverificação é testado no banco real, com relógio controlado: `WIN` aplicado logo que a `BET` chega (verificação antecipada pela chegada), transação não verificada antes do vencimento, novo agendamento com backoff sem repetir o evento, `REFERENCE_NOT_FOUND` no limite com o saldo do momento, `REFERENCE_NOT_PROCESSED` quando a referência ainda espera no limite, dependente de uma transação rejeitada verificado e rejeitado na hora, cadeia recebida de trás para frente (`ROLLBACK`, `WIN`, `BET`) resolvida inteira, dois `REFUND`s esperando a mesma `BET` (só um aplicado), erro inesperado contando tentativa até `FAILED`/`PROCESSING_ERROR`, erro transitório sem contar tentativa e 4 reverificações concorrentes sobre 24 transações em 8 wallets (cada uma aplicada exatamente uma vez). O worker é testado com o loop real, e a aplicação Nest real aplica pela fila um `WIN` recebido antes da `BET`. Mutações conferidas: sem o lock da wallet, ou sem reler a transação depois do lock, o teste concorrente falha.
 - **Reconciliação:** testada no banco real. Uma wallet com aposta, prêmio, `LOSS`, `ROLLBACK` e aposta rejeitada fica consistente, com a contagem certa de lançamentos. Uma wallet aberta com zero não tem lançamentos. Divergências são provocadas desligando o trigger de verificação: o resultado e o monitor sinalizam, e o saldo não é corrigido; diferença positiva e negativa. Wallet desconhecida e id malformado dão 404. Reconciliações contínuas enquanto 60 apostas são aplicadas na mesma wallet nunca dão divergência falsa; separando saldo e soma em duas consultas, o teste falha. Na API: formato da resposta, divergência sinalizada com 200, 404 e 400.
+- **Logs:** formato da linha, filtro por nível, serialização de erro, campos omitidos quando indefinidos; contexto propagado através de `await`, contextos aninhados e contextos concorrentes isolados; adaptador do NestJS. Os monitores são testados pelo conteúdo do log, inclusive a ausência de valores e saldos. No banco real: o `WageringMonitor` recebe o desfecho depois do commit, o replay como replay e nada quando a transação é desfeita ou dá conflito; a reverificação informa cada mudança de estado e nada quando a transação foi pulada. Na aplicação real: a linha de log da mensagem consumida traz `messageId`, `correlationId`, `sqsMessageId`, `transactionId`, `walletId` e `providerId`; a requisição HTTP é registrada com o `correlationId`; e nenhuma linha contém valores.
+- **Corrida na verificação de idempotência:** um repositório que deixa de achar a idempotency key uma vez simula a submissão idêntica confirmada entre as duas leituras. O resultado tem de ser replay (ou conflito de payload), e não conflito de `externalTransactionId`. Sem a correção, o teste falha. O teste de 20 entregas paralelas da mesma mensagem, que falhava às vezes por essa corrida, passou em 12 execuções seguidas.
 - Nenhum mock de banco nem de fila. **Planejado:** testes de concorrência com paralelismo real e múltiplos processos, crash e restart.
 
-## 15. Pendências
+## 16. Pendências
 
-Logs estruturados e métricas (incluindo divergências de reconciliação e atraso da outbox); autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.
+Métricas (incluindo divergências de reconciliação e atraso da outbox); autenticação (decisão a documentar); testes de concorrência e de falha; README de setup.

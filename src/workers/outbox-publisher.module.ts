@@ -1,7 +1,8 @@
-import { Inject, Logger, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap } from '@nestjs/common';
+import { Inject, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap } from '@nestjs/common';
 import { ApplicationModule } from '../application/application.module';
 import { PublishOutboxUseCase } from '../application/messaging/publish-outbox.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { OutboxPublisherWorker } from './outbox-publisher.worker';
 
 /** Liga o publisher da outbox ao ciclo de vida da aplicação (se habilitado na config). */
@@ -15,7 +16,7 @@ export class OutboxPublisherModule implements OnApplicationBootstrap, BeforeAppl
   ) {
     this.worker = new OutboxPublisherWorker({
       publish,
-      logger: new Logger('OutboxPublisher'),
+      logger: new StructuredLogger('OutboxPublisher'),
       options: { batchSize: config.outbox.batchSize, idleDelayMs: config.outbox.idleDelayMs },
     });
   }

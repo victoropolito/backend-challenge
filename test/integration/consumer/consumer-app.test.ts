@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout } from 'bu
 import { randomUUID } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
 import { createHttpApp } from '../../../src/http/create-http-app';
+import { configureLogging } from '../../../src/infrastructure/observability/structured-logger';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
@@ -20,6 +21,7 @@ const ENV_KEYS = [
 let db: TestDatabase;
 let queues: TestQueues;
 let app: INestApplication | undefined;
+const logLines: Record<string, any>[] = [];
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
 
 beforeAll(async () => {
@@ -35,11 +37,13 @@ beforeAll(async () => {
     REFERENCE_WORKER_IDLE_DELAY_MS: '100',
   });
   app = await createHttpApp({ logger: false });
+  configureLogging({ level: 'debug', write: (line) => logLines.push(JSON.parse(line)) });
   await app.listen(0);
 }, 30_000);
 
 afterAll(async () => {
   await app?.close();
+  configureLogging({ level: 'silent' });
   for (const key of ENV_KEYS) {
     if (originalEnv[key] === undefined) {
       delete process.env[key];
@@ -62,13 +66,14 @@ const openWallet = async () => {
   return (await created.json()) as { id: string; playerId: string };
 };
 
-const sendTransaction = (
+const sendTransaction = async (
   wallet: { id: string; playerId: string },
   data: { externalTransactionId: string; kind: string; amount: string; referenceExternalTransactionId?: string },
-) =>
-  queues.send(
+) => {
+  const messageId = randomUUID();
+  await queues.send(
     {
-      messageId: randomUUID(),
+      messageId,
       type: 'WagerTransactionRequested',
       occurredAt: new Date().toISOString(),
       data: {
@@ -86,6 +91,8 @@ const sendTransaction = (
     },
     wallet.id,
   );
+  return messageId;
+};
 
 const transactionOf = async (externalTransactionId: string) =>
   (await fetch(`${await baseUrl()}/providers/provider-a/wagering/transactions/${externalTransactionId}`)).json() as Promise<{
@@ -111,11 +118,30 @@ describe('consumer and outbox publisher in the application', () => {
     const wallet = await openWallet();
     const externalTransactionId = randomUUID();
 
-    await sendTransaction(wallet, { externalTransactionId, kind: 'BET', amount: '25.00' });
+    const messageId = await sendTransaction(wallet, { externalTransactionId, kind: 'BET', amount: '25.00' });
 
     await eventually(async () =>
       expect(await transactionOf(externalTransactionId)).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00' } }),
     );
+    const recorded = logLines.find(
+      (line) => line.message === 'Wager transaction recorded' && line.externalTransactionId === externalTransactionId,
+    );
+    expect(recorded).toMatchObject({
+      level: 'info',
+      context: 'Wagering',
+      messageId,
+      correlationId: messageId,
+      sqsMessageId: expect.any(String),
+      receiveCount: 1,
+      transactionId: expect.any(String),
+      walletId: wallet.id,
+      providerId: 'provider-a',
+      status: 'PROCESSED',
+      origin: 'SUBMISSION',
+    });
+    const walletRequest = logLines.find((line) => line.context === 'Http' && line.method === 'POST' && line.path === '/wallets');
+    expect(walletRequest).toMatchObject({ level: 'info', status: 201, correlationId: expect.any(String), durationMs: expect.any(Number) });
+    expect(logLines.filter((line) => JSON.stringify(line).includes('25.00') || 'amount' in line)).toEqual([]);
     await eventually(async () => expect(await queues.countMain()).toBe(0));
 
     const events: { eventType: string; data: { externalTransactionId?: string; walletId?: string } }[] = [];

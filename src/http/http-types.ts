@@ -8,6 +8,8 @@ export interface HttpRequest {
 
 export interface HttpResponse {
   headersSent: boolean;
+  statusCode: number;
+  on(event: 'finish', listener: () => void): void;
   status(code: number): HttpResponse;
   setHeader(name: string, value: string): void;
   json(body: unknown): void;

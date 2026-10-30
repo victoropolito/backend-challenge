@@ -1,15 +1,10 @@
-import {
-  Inject,
-  Logger,
-  Module,
-  type BeforeApplicationShutdown,
-  type OnApplicationBootstrap,
-} from '@nestjs/common';
+import { Inject, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap } from '@nestjs/common';
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { ApplicationModule } from '../application/application.module';
 import { Clock } from '../application/shared/clock';
 import { ConsumeWagerTransactionMessageUseCase } from '../application/wagering/consume-wager-transaction-message.use-case';
 import { APP_CONFIG, type AppConfig } from '../config/app-config';
+import { StructuredLogger } from '../infrastructure/observability/structured-logger';
 import { SqsWagerTransactionConsumer } from './sqs-wager-transaction-consumer';
 
 const QUEUE_LOOKUP_RETRY_MS = 2_000;
@@ -17,7 +12,7 @@ const QUEUE_LOOKUP_RETRY_MS = 2_000;
 /** Liga o consumidor da fila de transações ao ciclo de vida da aplicação (se habilitado na config). */
 @Module({ imports: [ApplicationModule] })
 export class ConsumerModule implements OnApplicationBootstrap, BeforeApplicationShutdown {
-  private readonly logger = new Logger('WagerTransactionConsumer');
+  private readonly logger = new StructuredLogger('WagerTransactionConsumer');
   private consumer: SqsWagerTransactionConsumer | undefined;
   private starting: Promise<void> | undefined;
   private shuttingDown = false;
@@ -60,10 +55,10 @@ export class ConsumerModule implements OnApplicationBootstrap, BeforeApplication
           options: { ...options, queueUrl: queueUrl!, deadLetterQueueUrl: deadLetterQueueUrl! },
         });
         this.consumer.start();
-        this.logger.log(`Consuming ${queues.wagerQueueName} (dead letters to ${queues.wagerDlqName})`);
+        this.logger.info('Consuming', { queue: queues.wagerQueueName, deadLetterQueue: queues.wagerDlqName });
         return;
       } catch (error) {
-        this.logger.warn(`Queues not available yet: ${(error as Error).message || (error as Error).name}`);
+        this.logger.warn('Queues not available yet', { reason: (error as Error).message || (error as Error).name });
         await Bun.sleep(QUEUE_LOOKUP_RETRY_MS);
       }
     }
