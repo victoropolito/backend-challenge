@@ -5,6 +5,7 @@ import { createHttpApp } from '../../../src/http/create-http-app';
 import { configureLogging } from '../../../src/infrastructure/observability/structured-logger';
 import { sampleValue } from '../../support/metrics';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
 setDefaultTimeout(30_000);
@@ -170,3 +171,5 @@ describe('consumer and outbox publisher in the application', () => {
     expect(Date.now() - closing).toBeLessThan(5_000);
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

@@ -4,6 +4,7 @@ import type { INestApplication } from '@nestjs/common';
 import { createHttpApp } from '../../../src/http/create-http-app';
 import { sampleValue } from '../../support/metrics';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 let db: TestDatabase;
 let app: INestApplication;
@@ -232,21 +233,27 @@ describe('POST /wallets/:walletId/reconciliation', () => {
 
   it('signals a divergence in the response', async () => {
     const wallet = await createWallet('100.00');
-    await db.transaction(async (execute) => {
-      await execute('alter table wallets disable trigger wallets_balance_matches_ledger');
-      await execute(`update wallets set balance = balance - 10 where id = ?`, [wallet.id]);
-      await execute('alter table wallets enable trigger wallets_balance_matches_ledger');
-    });
+    const tamper = (delta: string) =>
+      db.transaction(async (execute) => {
+        await execute('alter table wallets disable trigger wallets_balance_matches_ledger');
+        await execute(`update wallets set balance = balance + ${delta} where id = ?`, [wallet.id]);
+        await execute('alter table wallets enable trigger wallets_balance_matches_ledger');
+      });
+    await tamper('-10');
 
-    const response = await request('POST', `/wallets/${wallet.id}/reconciliation`);
+    try {
+      const response = await request('POST', `/wallets/${wallet.id}/reconciliation`);
 
-    expect(response.status).toBe(200);
-    expect(response.body).toMatchObject({
-      storedBalance: { amount: '90.00', currency: 'BRL' },
-      calculatedBalance: { amount: '100.00', currency: 'BRL' },
-      difference: { amount: '-10.00', currency: 'BRL' },
-      consistent: false,
-    });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        storedBalance: { amount: '90.00', currency: 'BRL' },
+        calculatedBalance: { amount: '100.00', currency: 'BRL' },
+        difference: { amount: '-10.00', currency: 'BRL' },
+        consistent: false,
+      });
+    } finally {
+      await tamper('10');
+    }
   });
 
   it('answers 404 for an unknown wallet and 400 for a malformed id', async () => {
@@ -489,3 +496,5 @@ describe('errors outside the API', () => {
     expect(response.body.checks.postgres).toEqual({ status: 'up' });
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

@@ -19,6 +19,7 @@ import {
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 let db: TestDatabase;
 
@@ -249,3 +250,5 @@ describe('CreateWalletUseCase', () => {
     expect(await persistedFor(playerId)).toEqual({ wallets: 0, transactions: 0, ledgerEntries: 0, outboxMessages: 0 });
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

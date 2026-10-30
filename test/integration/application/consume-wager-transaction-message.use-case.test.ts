@@ -30,6 +30,7 @@ import {
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 const CONSUMER = 'wager-transactions-consumer';
 
@@ -268,3 +269,5 @@ describe('ConsumeWagerTransactionMessageUseCase', () => {
     ).toBe(50);
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

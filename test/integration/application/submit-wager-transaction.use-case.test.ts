@@ -31,7 +31,8 @@ import {
   MikroOrmWalletRepository,
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
-import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { createTestDatabase, holdWalletLock, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 let db: TestDatabase;
 let submitUseCase: SubmitWagerTransactionUseCase;
@@ -591,6 +592,25 @@ describe('SubmitWagerTransactionUseCase', () => {
       expect((await storedWallet(wallet.id)).balance).toEqual(brl('100.00'));
     });
 
+    it('there is no global lock: a wallet locked by another transaction does not block a different wallet', async () => {
+      const [locked, free] = await Promise.all([openWallet('100.00'), openWallet('100.00')]);
+      const release = await holdWalletLock(db, locked.id);
+      try {
+        const blocked = submit(locked, { money: brl('10.00') });
+        let blockedDone = false;
+        void blocked.then(() => (blockedDone = true));
+
+        const result = await submit(free, { money: brl('10.00') });
+
+        expect(result.transaction.status).toBe(Status.Processed);
+        expect(blockedDone).toBe(false);
+        await release();
+        expect((await blocked).transaction.status).toBe(Status.Processed);
+      } finally {
+        await release();
+      }
+    });
+
     it('different wallets are processed independently', async () => {
       const wallets = await Promise.all(Array.from({ length: 5 }, () => openWallet('50.00')));
 
@@ -650,3 +670,5 @@ describe('SubmitWagerTransactionUseCase', () => {
     });
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

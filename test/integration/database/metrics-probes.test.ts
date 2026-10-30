@@ -20,7 +20,8 @@ import {
 } from '../../../src/infrastructure/database/repositories/mikro-orm-wallet.repository';
 import type { LockConflictReason } from '../../../src/infrastructure/database/transient-error';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
-import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { createTestDatabase, holdWalletLock, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 let db: TestDatabase;
 let createWallet: CreateWalletUseCase;
@@ -75,24 +76,6 @@ const waitUntil = async (condition: () => Promise<boolean>, timeoutMs = 5_000) =
   }
 };
 
-/** Trava a wallet numa transação separada até `release()`; quem chama fica fora do contexto dessa transação. */
-const holdWalletLock = async (walletId: string) => {
-  let release!: () => void;
-  const released = new Promise<void>((resolve) => (release = resolve));
-  let locked!: () => void;
-  const isLocked = new Promise<void>((resolve) => (locked = resolve));
-  const holder = db.transaction(async (execute) => {
-    await execute('select id from wallets where id = ? for update', [walletId]);
-    locked();
-    await released;
-  });
-  await isLocked;
-  return async () => {
-    release();
-    await holder;
-  };
-};
-
 describe('readBacklog', () => {
   it('counts unpublished events, the age of the oldest one and the transactions waiting for a reference', async () => {
     const wallet = await openWallet();
@@ -133,7 +116,7 @@ describe('wallet lock instrumentation', () => {
     const runner = new MikroOrmTransactionRunner(db.orm.em);
     const wallets = new MikroOrmWalletRepository(db.orm.em, (seconds) => waits.push(seconds));
 
-    const release = await holdWalletLock(wallet.id);
+    const release = await holdWalletLock(db, wallet.id);
     const waiting = runner.run(() => wallets.findByIdForUpdate(wallet.id));
     await waitUntil(async () => (await backendsWaitingForLock()) > 0);
     await Bun.sleep(150);
@@ -151,7 +134,7 @@ describe('wallet lock instrumentation', () => {
     const runner = new MikroOrmTransactionRunner(em, (reason) => conflicts.push(reason));
     const wallets = new MikroOrmWalletRepository(em);
 
-    const release = await holdWalletLock(wallet.id);
+    const release = await holdWalletLock(db, wallet.id);
     await expect(
       runner.run(async () => {
         await em.execute(`set local lock_timeout = '50ms'`);
@@ -173,3 +156,5 @@ describe('wallet lock instrumentation', () => {
     expect(conflicts).toEqual(['lock_timeout', 'wallet_version']);
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

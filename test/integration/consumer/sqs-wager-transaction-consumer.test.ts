@@ -31,6 +31,7 @@ import {
 import { WageringMetrics } from '../../../src/infrastructure/observability/wagering-metrics';
 import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-generator';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 import { createTestQueues, eventually, type TestQueues } from '../support/test-queues';
 
 setDefaultTimeout(30_000);
@@ -418,3 +419,5 @@ describe('SqsWagerTransactionConsumer', () => {
     });
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);

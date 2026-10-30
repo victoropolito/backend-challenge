@@ -80,3 +80,52 @@ export const SqlState = {
   NotNullViolation: '23502',
   RestrictViolation: '23001',
 } as const;
+
+export interface LedgerDivergence {
+  wallet_id: string;
+  balance: string;
+  ledger_balance: string;
+  last_balance_after: string | null;
+}
+
+/** Wallets cujo saldo difere da soma do ledger ou do saldo final do último lançamento (deve ser sempre vazio). */
+export function walletsDivergingFromLedger(db: TestDatabase): Promise<LedgerDivergence[]> {
+  return db.execute<LedgerDivergence>(`
+    select w.id as wallet_id,
+           w.balance::text as balance,
+           coalesce(totals.ledger_balance, 0)::numeric(38, 2)::text as ledger_balance,
+           last_entry.balance_after::text as last_balance_after
+      from wallets w
+      left join (
+        select wallet_id, sum(case direction when 'CREDIT' then amount else -amount end) as ledger_balance
+          from wallet_ledger_entries
+         group by wallet_id
+      ) totals on totals.wallet_id = w.id
+      left join lateral (
+        select balance_after from wallet_ledger_entries e where e.wallet_id = w.id order by e.sequence desc limit 1
+      ) last_entry on true
+     where w.balance <> coalesce(totals.ledger_balance, 0)
+        or w.balance <> coalesce(last_entry.balance_after, 0)
+  `);
+}
+
+/**
+ * Trava a wallet (`SELECT ... FOR UPDATE`) numa transação separada até a função devolvida ser chamada. Quem chama fica
+ * fora do contexto dessa transação, então as próprias operações dele disputam o lock de verdade.
+ */
+export async function holdWalletLock(db: TestDatabase, walletId: string): Promise<() => Promise<void>> {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let locked!: () => void;
+  const isLocked = new Promise<void>((resolve) => (locked = resolve));
+  const holder = db.transaction(async (execute) => {
+    await execute('select id from wallets where id = ? for update', [walletId]);
+    locked();
+    await released;
+  });
+  await isLocked;
+  return async () => {
+    release();
+    await holder;
+  };
+}

@@ -35,6 +35,7 @@ import { UuidV7Generator } from '../../../src/infrastructure/system/uuid-v7-gene
 import { PendingReferenceWorker } from '../../../src/workers/pending-reference.worker';
 import { silentLogger } from '../../support/loggers';
 import { createTestDatabase, type TestDatabase } from '../support/test-database';
+import { itKeepsEveryBalanceEqualToItsLedger } from '../support/ledger-invariant';
 
 const MAX_ATTEMPTS = 3;
 
@@ -414,3 +415,5 @@ describe('PendingReferenceWorker', () => {
     }
   });
 });
+
+itKeepsEveryBalanceEqualToItsLedger(() => db);
